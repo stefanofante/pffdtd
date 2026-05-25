@@ -159,9 +159,9 @@ class VoxScene:
             ix_vox,iy_vox,iz_vox = np.mgrid[0:Nhx,0:Nhy,0:Nhz]
 
             vox_ndist = np.full(vox_shape,np.inf,dtype=np.float64) #distance to nearest hit
-            vox_bp = np.full(vox_shape,False,dtype=np.bool8) #boundary point?
-            vox_adj = np.full((*vox_shape,NN),True,dtype=np.bool8) #adjacency to neighbours
-            vox_nb = np.full(vox_shape,False,dtype=np.bool8) #near a boundary (nothing to do with numba)
+            vox_bp = np.full(vox_shape,False,dtype=np.bool_) #boundary point?
+            vox_adj = np.full((*vox_shape,NN),True,dtype=np.bool_) #adjacency to neighbours
+            vox_nb = np.full(vox_shape,False,dtype=np.bool_) #near a boundary (nothing to do with numba)
             vox_tidx = np.full(vox_shape,-1,dtype=np.int32) #tri index for nearest hit
 
             #to store distances to tris
@@ -322,6 +322,8 @@ class VoxScene:
         self.print(f'{Nbt=}')
 
         #clean up shared memory
+        # Drop numpy view of the shm buffer before close (Python 3.13).
+        del Nb_proc
         Nb_proc_shm.close()
         Nb_proc_shm.unlink()
         #self.print(f'unlink')

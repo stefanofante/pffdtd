@@ -354,7 +354,7 @@ class SimEngine:
             ax.set_ylabel('y')
             extent=[xv[0],xv[-1],yv[0],yv[-1],]
             hh_xy = ax.imshow(uxy.T,extent=extent,origin='lower',aspect='equal')
-            ax.imshow(~bnm_xy.T,extent=extent,origin='lower',aspect='equal',alpha=np.float_(bnm_xy).T)
+            ax.imshow(~bnm_xy.T,extent=extent,origin='lower',aspect='equal',alpha=np.float64(bnm_xy).T)
             fig.colorbar(hh_xy)
 
             ms = 4

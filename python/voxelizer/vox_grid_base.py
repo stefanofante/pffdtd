@@ -187,6 +187,11 @@ class VoxGridBase:
             self.print(f'tribox checks={N_tribox_tests_tot} for {Ntris} tris and {Nvox} vox ({N_tribox_tests_tot/(Nvox*Ntris)*100.0:.2f} %)')
 
             #cleanup shared memory
+            # Drop numpy views first: Python 3.13's SharedMemory.close()
+            # raises BufferError if any exported buffer (e.g. a numpy
+            # array using the shm as its base) is still alive.
+            del Ntris_vox
+            del N_tribox_tests
             Ntris_vox_shm.close()
             Ntris_vox_shm.unlink()
 
