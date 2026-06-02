@@ -205,7 +205,12 @@ uint64_t print_gpu_details(int i) {
    cudaGetDeviceProperties(&prop, i);
    printf("\nDevice Number: %d [%s]\n", i, prop.name);
    printf("  Compute: %d.%d\n",prop.major,prop.minor);
+#if CUDART_VERSION >= 13000
+   int pffdtd_memClkKHz=0; cudaDeviceGetAttribute(&pffdtd_memClkKHz, cudaDevAttrMemoryClockRate, i); //CUDA 13: memoryClockRate removed from cudaDeviceProp
+   printf("  Peak Memory Bandwidth: %.3f GB/s\n", 2.0*pffdtd_memClkKHz*(prop.memoryBusWidth/8)/1.0e6);
+#else
    printf("  Peak Memory Bandwidth: %.3f GB/s\n", 2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
+#endif
    printf("  Total global memory: [ %.3f GB | %.3f GiB | %lu MiB ]\n", (double)prop.totalGlobalMem/(1e9), (double)prop.totalGlobalMem/1073741824ULL, prop.totalGlobalMem>>20);
    printf("  Registers per block: %d\n", prop.regsPerBlock);
    printf("  Concurrent Kernels: %d\n", prop.concurrentKernels);
@@ -550,7 +555,9 @@ void split_data(const struct SimData *sd, struct gpuHostData *ghds, int ngpus) {
    assert(Nx_check==Nx);
 
    //now count Nr,Ns,Nb for each device
-   int64_t Nxcc[ngpus];
+   //Windows/MSVC port: VLA (C99) not allowed when nvcc compiles as C++; fixed max GPUs.
+   assert(ngpus <= 64);
+   int64_t Nxcc[64];
    Nxcc[0] = ghds[0].Nx;
    printf("Nxcc[%d]=%ld\n",0,Nxcc[0]);
    for (int gid=1; gid<ngpus; gid++) {
