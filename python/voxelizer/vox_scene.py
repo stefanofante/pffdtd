@@ -123,10 +123,10 @@ class VoxScene:
 
         min_vox_shape = (Nh,Nh,Nh) #for memory calculation
 
-        #set up shared memory
-        Nb_proc_shm = shared_memory.SharedMemory(create=True,size=Nprocs*np.dtype(np.int64).itemsize)
-        Nb_proc = np.frombuffer(Nb_proc_shm.buf,dtype=np.int64)
-        Nb_proc[:] = 0 
+        # Sprint 6.29: per-process boundary tally via worker RETURN values
+        # instead of shared_memory (nested-closure + shared_memory break on
+        # Windows spawn). Bit-exact: per-voxel compute is unchanged.
+        Nb_proc = np.zeros(Nprocs, dtype=np.int64)
 
         NN = self.NN
 
@@ -261,8 +261,8 @@ class VoxScene:
             assert qq.size == qq2.size
             #assert np.intersect1d(qq,qq2).size == qq2.size
             assert np.all(qq==qq2)
-            #tally boundary points inside vox without halo (add on to tally for process)
-            Nb_proc[proc_idx] += np.sum(vox_bp.flat[:])
+            #tally boundary points inside vox without halo (returned for aggregation)
+            nb_count = int(np.sum(vox_bp.flat[:]))
 
             ndist_bn_vox = vox_ndist.flat[qq]
             tidx_bn_vox = vox_tidx.flat[qq]
@@ -278,23 +278,25 @@ class VoxScene:
             h5f_vox.create_dataset('ndist_bn', data=ndist_bn_vox)
             h5f_vox.create_dataset('bn_ixyz_loc', data=bn_ixyz_loc_vox)
             h5f_vox.close()
+            return nb_count
 
         def process_voxels(idx_list,proc_idx):
-            #using one progress bar because tqdm has problems with multiple, and cleaner 
+            #using one progress bar because tqdm has problems with multiple, and cleaner
+            nb_total = 0
             pbar = tqdm(total=len(idx_list),desc=f'process {proc_idx:02d} voxeliser processing',ascii=True,leave=False,position=0)
             for idx in idx_list:
-                process_voxel(idx,proc_idx)
+                nb_total += process_voxel(idx,proc_idx)
                 pbar.update(1)
             pbar.close()
+            return nb_total
 
         self.timer.tic('calc_adj total')
         self.timer.tic('ray-tri checks')
 
         if Nprocs==1: #no need to use mp
-            process_voxels(range(Nvox_nonempty),0)
+            Nb_proc[0] = process_voxels(range(Nvox_nonempty),0)
 
         else: #multiproc with vox grid
-            procs = []
             idx_lists = [[] for i in range(Nprocs)]
             #only random shuffle for balancing
             vox_order = np.random.permutation(Nvox_nonempty)
@@ -302,16 +304,17 @@ class VoxScene:
                 cc = np.argmin([len(l) for l in idx_lists])
                 idx_lists[cc].append(vox_order[qq])
 
+            # Sprint 6.29: dispatch via joblib loky (cloudpickle-serialises the
+            # nested closure -> works on Windows spawn, unlike raw mp.Process).
+            # Workers RETURN their boundary tally; the per-voxel HDF5 files carry
+            # the boundary data (cross-process). Bit-exact: compute unchanged.
+            from joblib import Parallel, delayed
+            nb_totals = Parallel(n_jobs=int(Nprocs), backend="loky")(
+                delayed(process_voxels)(idx_lists[proc_idx], proc_idx)
+                for proc_idx in range(Nprocs)
+            )
             for proc_idx in range(Nprocs):
-                idx_list = idx_lists[proc_idx]
-                proc = mp.Process(target=process_voxels, args=(idx_list,proc_idx))
-                procs.append(proc)
-
-            for proc_idx in range(Nprocs):
-                procs[proc_idx].start()
-
-            for one_proc in procs:
-                one_proc.join()
+                Nb_proc[proc_idx] = nb_totals[proc_idx]
 
         self.print(self.timer.ftoc('ray-tri checks'))
 
@@ -321,12 +324,8 @@ class VoxScene:
         Nbt = np.sum(Nb_proc)
         self.print(f'{Nbt=}')
 
-        #clean up shared memory
-        # Drop numpy view of the shm buffer before close (Python 3.13).
-        del Nb_proc
-        Nb_proc_shm.close()
-        Nb_proc_shm.unlink()
-        #self.print(f'unlink')
+        # Sprint 6.29: shared_memory removed (Nb_proc is a regular array filled
+        # from worker return values).
 
         #unified arrays
         bn_ixyz = np.full((Nbt,),-1,dtype=np.int64)

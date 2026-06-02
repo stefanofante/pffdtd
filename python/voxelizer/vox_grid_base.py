@@ -95,39 +95,37 @@ class VoxGridBase:
             if Nprocs>1:
                 clear_dat_folder('mmap_dat')
 
-            #create shared memory
-            Ntris_vox_shm = shared_memory.SharedMemory(create=True,size=Nvox*np.dtype(np.int64).itemsize)
-            Ntris_vox = np.frombuffer(Ntris_vox_shm.buf, dtype=np.int64)
-            #alternative syntax
-            #Ntris_vox = np.ndarray((Nvox,), dtype=np.int64, buffer=Ntris_vox_shm.buf)
-
-            #use as buffer view to np array
-            N_tribox_tests_shm = shared_memory.SharedMemory(create=True,size=Nvox*np.dtype(np.int64).itemsize)
-            N_tribox_tests = np.frombuffer(N_tribox_tests_shm.buf, dtype=np.int64)
-
-            Ntris_vox[:] = 0
-            N_tribox_tests[:] = 0
+            # Sprint 6.29: regular arrays + worker RETURN values instead of
+            # shared_memory. The previous nested-closure + shared_memory pattern
+            # breaks on Windows spawn (closures unpicklable; shared_memory
+            # BufferError/PermissionError). Bit-exact: the per-voxel compute
+            # (process_voxel body) is byte-for-byte unchanged.
+            Ntris_vox = np.zeros(Nvox, dtype=np.int64)
+            N_tribox_tests = np.zeros(Nvox, dtype=np.int64)
 
             #looping through boxes makes more sense because we append to voxels (for multithreading)
             def process_voxel(vox):
                 candidates = np.nonzero(np.all(np.logical_and(vox.bmax >= tri_bmin,vox.bmin <= tri_bmax),axis=-1))[0]
                 tri_idxs_vox = []
-                N_tribox_tests[vox.idx] += candidates.size
                 hits = tri_box_intersection_vec(vox.bmin,vox.bmax,tris_pre[candidates])
                 tri_idxs_vox = candidates[hits].tolist()
-                return tri_idxs_vox
+                return tri_idxs_vox, int(candidates.size)
 
             def process_voxels(vidx_list,proc_idx):
+                # Returns {vox_idx: (ntris, ntribox_tests)}; writes the per-voxel
+                # .dat files (cross-process safe). No shared-memory writes.
+                out = {}
                 pbar = tqdm(total=len(vidx_list),desc=f'process {proc_idx:02d} voxgrid processing',ascii=True,leave=False,position=0)
                 for vox_idx in vidx_list:
-                    tri_idxs_vox = process_voxel(self.voxels[vox_idx])
-                    Ntris_vox[vox_idx] = len(tri_idxs_vox)
+                    tri_idxs_vox, n_tribox = process_voxel(self.voxels[vox_idx])
+                    out[int(vox_idx)] = (len(tri_idxs_vox), n_tribox)
                     #if not empty, save vox data as file
                     if len(tri_idxs_vox)>0:
                         np.array(tri_idxs_vox,dtype=np.int64).tofile(f'mmap_dat/vox_{vox_idx}.dat')
                     pbar.update(1)
 
                 pbar.close()
+                return out
 
             
             if Nprocs==1: #keep separate for debug purposes
@@ -135,8 +133,9 @@ class VoxGridBase:
                 pbar = tqdm(total=Nvox,desc=f'single process voxgrid processing',ascii=True,leave=False)
                 for vox_idx in range(Nvox):
                     vox = self.voxels[vox_idx]
-                    tri_idxs_vox = process_voxel(vox)
+                    tri_idxs_vox, n_tribox = process_voxel(vox)
                     Ntris_vox[vox_idx] = len(tri_idxs_vox)
+                    N_tribox_tests[vox_idx] = n_tribox
                     pbar.update(1)
                     if Ntris_vox[vox_idx]>0:
                         vox.tri_idxs = tri_idxs_vox
@@ -147,8 +146,6 @@ class VoxGridBase:
                 pbar.close()
 
             elif Nprocs>1:
-                procs = []
-
                 vox_idx_lists = [[] for i in range(Nprocs)]
                 vox_order = np.random.permutation(Nvox)
                 #vox_order = np.arange(Nvox)
@@ -156,15 +153,19 @@ class VoxGridBase:
                     cc = np.argmin([len(l) for l in vox_idx_lists])
                     vox_idx_lists[cc].append(vox_order[idx])
 
-                for proc_idx in range(Nprocs):
-                    proc = mp.Process(target=process_voxels, args=(vox_idx_lists[proc_idx],proc_idx))
-                    procs.append(proc)
-
-                for proc_idx in range(Nprocs):
-                    procs[proc_idx].start()
-
-                for one_proc in procs:
-                    one_proc.join()
+                # Sprint 6.29: dispatch via joblib loky (cloudpickle-serialises the
+                # nested closure -> works on Windows spawn, unlike raw mp.Process).
+                # Workers RETURN their per-voxel counts; we aggregate here. The
+                # per-voxel .dat files (written by the workers) carry the tri lists.
+                from joblib import Parallel, delayed
+                partials = Parallel(n_jobs=int(Nprocs), backend="loky")(
+                    delayed(process_voxels)(vox_idx_lists[proc_idx], proc_idx)
+                    for proc_idx in range(Nprocs)
+                )
+                for part in partials:
+                    for vidx, (ntris, ntribox) in part.items():
+                        Ntris_vox[vidx] = ntris
+                        N_tribox_tests[vidx] = ntribox
 
                 #now load from temp files
                 for vox_idx in range(Nvox):
@@ -186,17 +187,7 @@ class VoxGridBase:
             N_tribox_tests_tot = np.sum(N_tribox_tests)
             self.print(f'tribox checks={N_tribox_tests_tot} for {Ntris} tris and {Nvox} vox ({N_tribox_tests_tot/(Nvox*Ntris)*100.0:.2f} %)')
 
-            #cleanup shared memory
-            # Drop numpy views first: Python 3.13's SharedMemory.close()
-            # raises BufferError if any exported buffer (e.g. a numpy
-            # array using the shm as its base) is still alive.
-            del Ntris_vox
-            del N_tribox_tests
-            Ntris_vox_shm.close()
-            Ntris_vox_shm.unlink()
-
-            N_tribox_tests_shm.close()
-            N_tribox_tests_shm.unlink()
+            # Sprint 6.29: shared_memory removed (regular arrays + worker returns).
 
             self.print(f'tris redundant={Ntris_vox_tot}, {100.*Ntris_vox_tot/self.Ntris:.2f} %')
             self.print(f'avg tris per voxel={Ntris_vox_tot/Nvox:.2f}')
