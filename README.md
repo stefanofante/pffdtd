@@ -23,6 +23,16 @@ PFFDTD is designed to run on a Linux system (e.g. Ubuntu/Centos/Arch).
 PFFDTD requires at least Python 3.9 to run, with additional required packages in pip_requirements.txt (for pip) or
 conda_pffdtd.yml (for conda).  Conda (or miniconda) is recommended to get started with a PFFDTD-specific conda environment (see .yml file).
 
+> **Version — RaySound unified env (ENV-3.14).** Vendored into RaySound as the submodule
+> `extern/pffdtd` and imported via `sys.path` (no packaging of its own — no `requires-python`
+> to pin here). Inside RaySound the target is the **single** environment:
+> - **Python `>=3.14,<3.15`** (fixed ceiling), aarch64 (GB10 Grace Blackwell / DGX Spark) +
+>   x86_64, Linux, **CUDA 13**.
+> - pffdtd's compiled deps (`numpy`, `scipy`, `numba`/`llvmlite`, `h5py`) all have **cp314**
+>   aarch64 wheels — which is *why* the ceiling is 3.14 and not 3.15: on 3.15 (beta) `numba`
+>   is category-C (broken on the new bytecode until upstream ~2027), which would block this
+>   FDTD branch. Rationale: RaySound root README.
+
 ### Installation (C/CUDA)
 To compile, run 'make all' in the c_cuda folder.  
 
