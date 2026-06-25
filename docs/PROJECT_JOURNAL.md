@@ -100,3 +100,18 @@ evidenza sostitutiva misurata):**
 **Decisione:** default 32x2x2 invariato, nessun codice. Non ritentare il
 block-dim su questa GPU: la leva non e' la geometria di lancio ma la banda
 (-> e' li' che punta il rewrite z-slab/tiling B9, se serve).
+
+---
+
+## 2026-06-25 — B9 z-slab tiling air: -14% su GB10, APERTO su RTX 4500 Ada
+**GB10 (LPDDR5X unified, sm_121):** tiled vs ref interleaved 10-round, CUPTI.
+ref 8.726 ms min, tiled 10.116 ms min -> -13.7% (median -13.9%, StdDev 0.15%,
+robusto, no jitter). Banda stimata 220->190 GB/s. Correttezza Delta=0.
+**Causa:** z-slab march riduce il parallelismo (160M thread -> (Nz-2)(Ny-2)
+thread con loop seriale su cz); su kernel memory-bound il parallelismo che
+nasconde la latenza conta piu' del register-reuse, che la L2 GB10 (grande,
+cattura le 3 slab ~2.1MB) dava gia' gratis.
+**APERTO su RTX 4500 Ada:** architettura memoria diversa (GDDR6 dedicata,
+L2 piu' piccola). Se la L2 Ada NON cattura il working-set 3-slab, il bilancio
+parallelismo-vs-reuse puo' girare. Codice in branch wip/b9-air-tiled, bench
+Ada da eseguire sulla workstation. NON archiviato come negativo definitivo.
