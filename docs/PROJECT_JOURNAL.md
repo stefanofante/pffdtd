@@ -115,3 +115,24 @@ cattura le 3 slab ~2.1MB) dava gia' gratis.
 L2 piu' piccola). Se la L2 Ada NON cattura il working-set 3-slab, il bilancio
 parallelismo-vs-reuse puo' girare. Codice in branch wip/b9-air-tiled, bench
 Ada da eseguire sulla workstation. NON archiviato come negativo definitivo.
+
+---
+
+## 2026-06-25 — B10 bn_mask: non rimovibile + guadagno <1% (finding negativo da analisi)
+**Ipotesi audit:** il load bn_mask[ii>>3] per cella nel kernel air e' ridondante
+se il boundary riscrive quei nodi DOPO l'air -> rimuoverlo toglierebbe uno stream
+di load su 160M celle/step.
+**Sequenza reale (verificata, gpu_engine.h:1076-1134):** l'ordine e' boundary -> air,
+NON air -> boundary. cuStream_bn esegue RigidCart + CopyFromGrid + BoundaryFD
+(impedenza) + CopyToGrid sui nodi bnl; poi cudaStreamWaitEvent serializza
+cuStream_air DIETRO il boundary; l'air gira dopo. L'unico kernel post-air e'
+KernelBoundaryABC (nodi bna = bordo assorbente, NON i bnl materiali).
+**Kill-criterion 1 (load-bearing):** togliere il mask fa scrivere all'air u0[ii]
+sui nodi bnl, sovrascrivendo il valore d'impedenza appena calcolato. Nessun kernel
+rigira dopo a correggerlo -> corruzione deterministica. Il mask NON e' ridondante:
+e' il meccanismo che protegge i nodi boundary dal clobber dell'air.
+**Kill-criterion 2 (sotto soglia):** anche fosse safe, bn_mask = 1 byte/8 celle =
+ceil(Npts/8) = 19.99 MB/step vs floor air 1.918 GB/step = 1.04%, per giunta
+L2-resident -> impatto DRAM reale <1%, sotto la soglia 5%.
+**Conclusione:** non rimovibile e comunque trascurabile. Archiviato, nessun codice.
+L'audit aveva l'ordine degli stream invertito.
