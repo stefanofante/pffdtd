@@ -114,6 +114,8 @@ __global__ void FlipHaloXZ_Ybeg(Real * __restrict__ u1);
 __global__ void FlipHaloXZ_Yend(Real * __restrict__ u1);
 __global__ void FlipHaloYZ_Xbeg(Real * __restrict__ u1);
 __global__ void FlipHaloYZ_Xend(Real * __restrict__ u1);
+template<typename Idx>
+__global__ void FlipHaloFaces(Real * __restrict__ u1);
 
 //this is data on host, sometimes copied and recomputed for copy to GPU devices (indices), sometimes just aliased pointers (scalar arrays)
 struct gpuHostData { //arrays on host (for copy), mirrors gpu local data 
@@ -527,6 +529,30 @@ __global__ void FlipHaloYZ_Xend(Real * __restrict__ u1)
       int64_t ii;
       ii = cz*cuNxNy + cy*cuNx + (cuNx-1);
       u1[ii] = u1[ii-2];
+   }
+}
+
+//B11: fused kernel for the 3 always-present halo faces (XZ_Ybeg + YZ_Xbeg + YZ_Xend)
+//in a single launch (blockIdx.z selects the face). NB the y=0 plane (XZ_Ybeg) overlaps
+//the x=0 / x=Nx-1 columns (YZ_Xbeg/Xend) at the edges; in the separate launches YZ runs
+//last and wins there. Here XZ skips those two columns (owned by YZ) so the writes are
+//disjoint and reproduce the separate last-writer result -> bit-identical. Same math.
+template<typename Idx>
+__global__ void FlipHaloFaces(Real * __restrict__ u1)
+{
+   const Idx Nx   = (Idx)cuNx;
+   const Idx Ny   = (Idx)cuNy;
+   const Idx Nz   = (Idx)cuNz;
+   const Idx NxNy = (Idx)cuNxNy;
+   Idx a = blockIdx.x*cuBx2 + threadIdx.x;
+   Idx b = blockIdx.y*cuBy2 + threadIdx.y;
+   if (b >= Nz) return;
+   if (blockIdx.z == 0) {            //XZ_Ybeg: y=0 plane, skip x=0 & x=Nx-1 (owned by YZ)
+      if (a >= 1 && a < Nx-1) { Idx ii = b*NxNy + a;            u1[ii] = u1[ii + 2*Nx]; }
+   } else if (blockIdx.z == 1) {     //YZ_Xbeg: x=0 column
+      if (a < Ny)             { Idx ii = b*NxNy + a*Nx;         u1[ii] = u1[ii + 2];    }
+   } else {                          //YZ_Xend: x=Nx-1 column
+      if (a < Ny)             { Idx ii = b*NxNy + a*Nx + (Nx-1); u1[ii] = u1[ii - 2];   }
    }
 }
 
@@ -1105,6 +1131,8 @@ double run_sim(const struct SimData *sd)
 
          //for absorbing boundaries at boundaries of grid
          CopyFromGridKernel<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u2ba, gd->u0, gd->bna_ixyz, ghd->Nba);
+#ifdef HALO_SEPARATE
+         //B11 A/B reference: original 6 separate halo-flip launches
          if (gid==0) {
             FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
          }
@@ -1117,6 +1145,31 @@ double run_sim(const struct SimData *sd)
          }
          FlipHaloYZ_Xbeg<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
          FlipHaloYZ_Xend<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
+#else
+         //B11: conditional faces separate (different guards), 3 always-present faces fused.
+         //Order preserved: conditionals (XY_*, XZ_Yend) launch BEFORE the fused kernel so the
+         //shared edges keep the separate last-writer result.
+         if (gid==0) {
+            FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
+         }
+         if (gid==ngpus-1) {
+            FlipHaloXY_Zend<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
+         }
+         if (sd->fcc_flag==0) {
+            FlipHaloXZ_Yend<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,gd->cuStream_air>>>(gd->u1);
+         }
+         {
+            int64_t amax = (sd->Nz > sd->Ny) ? sd->Nz : sd->Ny;  //a-axis covers max(Nx_kernel=Nz, Ny)
+            dim3 bdh(cuBx2, cuBy2, 1);
+            dim3 gdh(CU_DIV_CEIL(amax,cuBx2), CU_DIV_CEIL(ghd->Nxh,cuBy2), 3);
+            if (ghd->Npts < INT32_MAX) {
+               FlipHaloFaces<int32_t><<<gdh,bdh,0,gd->cuStream_air>>>(gd->u1);
+            }
+            else {
+               FlipHaloFaces<int64_t><<<gdh,bdh,0,gd->cuStream_air>>>(gd->u1);
+            }
+         }
+#endif
 
          //injecting source first, negation done inside kernel (NB source on different stream than bn)
          if (ghd->Ns>0) {

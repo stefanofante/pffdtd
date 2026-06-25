@@ -136,3 +136,24 @@ ceil(Npts/8) = 19.99 MB/step vs floor air 1.918 GB/step = 1.04%, per giunta
 L2-resident -> impatto DRAM reale <1%, sotto la soglia 5%.
 **Conclusione:** non rimovibile e comunque trascurabile. Archiviato, nessun codice.
 L'audit aveva l'ordine degli stream invertito.
+
+---
+
+## 2026-06-25 — B11 halo flip fusion: 3 facce sempre-presenti in 1 lancio (committato)
+**Contesto:** 6 kernel FlipHalo (ghost-cell mirror Neumann) lanciati separatamente
+ogni step. Le 3 sempre-presenti (XZ_Ybeg, YZ_Xbeg, YZ_Xend) fuse in 1 kernel
+FlipHaloFaces<Idx> (dispatch su blockIdx.z). Le 3 condizionali (XY_Zbeg/Zend gid,
+XZ_Yend fcc) restano separate, lanciate PRIMA del fuso (ordine spigoli preservato).
+Switch -DHALO_SEPARATE mantiene i 6 originali per A/B.
+**Correttezza:** le facce NON sono disgiunte (il piano y=0 interseca le colonne
+x=0/x=Nx-1 sugli spigoli); nei lanci separati YZ gira dopo XZ e vince. Nel fuso XZ
+skippa quelle 2 colonne (di proprieta' YZ) -> writes disgiunte, stesso last-writer
+-> Delta=0 (gate small cart E fcc).
+**Bench (CUPTI flip-exec, interleaved 10-round, std ~0.5%):** large 824.2->825.3
+us/step (neutro, -0.1%); small 80.57->79.22 us/step (+1.7% robusto, 1 rampa vs 3).
+Combined loop-time troppo rumoroso (std 30% small / 6% large) per risolvere il
+saving lanci.
+**Esito:** guadagno reale ma piccolo (+1.7% sui flip small = ~0.1% del passo;
+launch-overhead -2 lanci non misurabile). Committato perche' bit-identico,
+marginalmente positivo e codice piu' pulito (6->4 lanci, 1-GPU cart). Nessun
+effetto osservabile su build/comportamento -> nessuna nota README.
