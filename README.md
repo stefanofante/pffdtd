@@ -25,6 +25,27 @@ read-out and progress/sync, memory-footprint cleanup). The numerical scheme is
 unchanged: forward results match the reference Python engine to machine accuracy.
 These changes are **not submitted upstream** and are maintained here independently.
 
+### Optimizations applied vs upstream
+
+The following changes have been made to the GPU engine relative to
+[bsxfun/pffdtd](https://github.com/bsxfun/pffdtd). The numerical scheme is
+unchanged; forward output matches the reference Python engine to machine accuracy.
+
+- **Build target.** Upstream compiled for `sm_35` (Kepler), which runs in
+  PTX-JIT compatibility mode on modern GPUs. Now `-arch=native` plus
+  `-Xptxas -O3`, producing a real binary for the host architecture.
+- **Multi-GPU peer access.** Upstream issued `cudaMemcpyPeerAsync` for halo
+  exchange without ever enabling P2P, silently staging transfers through host
+  RAM. Now `cudaDeviceEnablePeerAccess` is set up for every accessible device
+  pair, with an explicit host-staging fallback when P2P is unavailable.
+- **Batched source injection.** Upstream launched one `<<<1,1>>>` kernel per
+  source per timestep (Ns x Nt micro-launches). Now a single batched kernel
+  per timestep over all sources, with source signals and indices uploaded to
+  the device once at init.
+- **Blocked read-out.** Upstream did a per-timestep device-to-host copy plus
+  synchronisation for the receiver outputs. Now outputs accumulate in a device
+  buffer and drain in blocks, cutting per-step PCIe transfers and sync points.
+
 Performance work is tuned on the hardware I run it on:
 
 - **NVIDIA RTX 4500 Ada Generation** (24 GB, dedicated VRAM) — the workstation baseline.
