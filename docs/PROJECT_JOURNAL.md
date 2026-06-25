@@ -157,3 +157,21 @@ saving lanci.
 launch-overhead -2 lanci non misurabile). Committato perche' bit-identico,
 marginalmente positivo e codice piu' pulito (6->4 lanci, 1-GPU cart). Nessun
 effetto osservabile su build/comportamento -> nessuna nota README.
+
+---
+
+## 2026-06-25 — B12 packing vh1/gh1: padding fuori dal traffico (finding negativo da analisi)
+**Ipotesi audit:** vh1/gh1 allocati Nbl x MMb (MMb=12) con padding -> traffico
+sprecato su KernelBoundaryFD (15% del passo).
+**Fatto decisivo (gpu_engine.h:419,431):** entrambi i loop sono for(m=0;m<cuMb[k];m++)
+-> il kernel legge/scrive solo i cuMb poli USATI, NON i MMb allocati. Il padding e'
+solo VRAM allocata, mai toccata dal loop. La premessa "padding -> traffico" e' falsa.
+**cuMb reale (scena CTK):** tutti gli 8 materiali = 11 rami ADE su MMb=12. Padding
+= 1 ramo (~8%), non 3x. Le impedenze sono fit ricchi a 11 poli.
+**Traffico vh1/gh1:** ~91% del traffico DRAM per-nodo del kernel (176 B: read+write
+11 poli x 2 campi x 4B), layout gia' pole-major [m*Nbl+nb] coalescato. E' traffico
+REALE e irriducibile (11 poli usati), non padding.
+**Guadagno atteso packing:** ~0% sul tempo (loop gia' minimale, legge solo cuMb;
+padding gia' piccolo; layout gia' coalescato). Risparmio solo VRAM: ~31 MB su 128 GB.
+**Verdetto:** padding fuori dal traffico + <2% -> archiviato, nessun codice.
+Come B10, l'audit aveva il meccanismo invertito (pensava si leggesse MMb, si legge cuMb).
