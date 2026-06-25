@@ -42,7 +42,8 @@ CFLAGS += -O3
 LDFLAGS = -fopenmp -lgomp -lm
 LDFLAGS += -L$(HDF5_LIB) -lhdf5
 
-NVCCFLAGS = -I$(IDIR) -O3 -arch=sm_35
+NVCCFLAGS = -I$(IDIR) -O3 -arch=native
+NVCCFLAGS += -Xptxas -O3 -lineinfo
 NVCCFLAGS += -x cu #compile .c or .h as cuda
 NVCCFLAGS += -I$(HDF5_INC)
 #NVCCFLAGS += -ptx
