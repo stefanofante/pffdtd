@@ -70,3 +70,33 @@ darebbe Delta=0.
 **Conclusione:** u1b e' il meccanismo corretto e piu' economico (carry a puntatore,
 costo zero). A6 archiviato, nessun codice. Non ritentare: l'audit pesava la memoria
 ma non il costo del gather sostitutivo.
+
+---
+
+## 2026-06-25 — B8 sweep block-dim air: nessuna config batte 32x2x2 (finding negativo)
+**Contesto:** sweep geometria blocco air (cart+fcc) per ridurre il tempo del
+kernel dominante (~36% Nsight).
+**Metodo:** 6 config (32x2x2 base, 32x4x2, 32x8x1, 64x2x2, 64x4x1, 128x2x1),
+5 run/config, poi interleaved 10-round anti-clock-drift su large grid.
+Gate correttezza: tutte bit-identiche (block-shape non tocca i valori).
+**Risultato:** sweep iniziale dava 32x8x1 +5.7% sul min, MA era jitter di clock
+(GB10, no clock-lock senza root). Interleaved: 32x8x1 = +1.8% min, PEGGIORE su
+median/mean. launch_bounds peggiora (limita occupancy, zero beneficio banda).
+Nessuna config batte 32x2x2 >5% in modo robusto.
+**Causa fisica (HW counters non disponibili - ERR_NVGPUCTRPERM, serve root;
+evidenza sostitutiva misurata):**
+- CUPTI kernel-trace (no HW counter), large grid, 1020 istanze KernelAirCart:
+  32x2x2 = 8.701 ms avg / 8.607 min; 32x8x1 = 8.625 / 8.514. Delta ~0.9% avg
+  (~1.1% min), DENTRO lo StdDev (~1.6%). Il kernel air dominante (~57% del tempo)
+  e' insensibile alla forma del blocco -> la geometria di lancio non e' la leva.
+- Banda effettiva (STIMA analitica, lower-bound, non misura HW): 7-punti su 159.9M
+  celle in ~8.70 ms, traffico DRAM minimo con riuso L2 ideale = 3*Npts*4B
+  ~1.92 GB/step -> ~220 GB/s ~= 80% del picco GB10 (~273 GB/s LPDDR5X). Essendo
+  lower-bound (riuso reale imperfetto), la saturazione effettiva e' >=. Coerente
+  con kernel bandwidth-bound, banda ~satura.
+- dram__throughput HW non ottenibile in questo ambiente (counter ristretti).
+  La causa e' confermata INDIRETTAMENTE (kernel-time insensibile + banda stimata
+  satura), non via counter diretto.
+**Decisione:** default 32x2x2 invariato, nessun codice. Non ritentare il
+block-dim su questa GPU: la leva non e' la geometria di lancio ma la banda
+(-> e' li' che punta il rewrite z-slab/tiling B9, se serve).
