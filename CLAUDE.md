@@ -27,6 +27,11 @@ fork è strumento di ricerca/benchmark, non parte del pipeline di produzione.
   .git/info/exclude finché si lavora sui file C/CUDA.
 - Ogni modifica che cambia i bit va validata: sim_outs.h5 vs baseline
   a machine accuracy (oracle = engine Python invariato). Diverge → ROLLBACK.
+- Il README deve seguire le modifiche sostanziali. Quando un'ottimizzazione
+  cambia comportamento, build, performance o requisiti rispetto al repo
+  originale, aggiornare il README nello STESSO commit (o in commit dedicato
+  contestuale), descrivendo l'ottimizzazione applicata rispetto a bsxfun/pffdtd.
+  Refactor interni che non cambiano nulla di osservabile NON richiedono nota README.
 
 ## Invarianti numerici
 - Schema FDTD invariato: forward identico al reference Python a machine accuracy.
