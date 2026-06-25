@@ -1,3 +1,67 @@
+# PFFDTD — fork
+
+> **This is a derivative fork** (`stefanofante/pffdtd`), maintained by
+> **Stefano Fante (ST-LINE S.r.l., Treviso, Italy)**.
+> It is **not** the upstream project. The original PFFDTD was written by **Brian Hamilton**
+> (University of Edinburgh, 2021) and is released under the MIT License — see
+> [`bsxfun/pffdtd`](https://github.com/bsxfun/pffdtd) and the `LICENSE` file. All credit for the
+> original simulator, its algorithms and its published references belongs to him. If this code
+> contributes to academic work, please cite the original software:
+>
+> ```
+> @misc{hamilton2021pffdtd,
+>   title  = {PFFDTD Software},
+>   author = {Brian Hamilton},
+>   note   = {https://github.com/bsxfun/pffdtd},
+>   year   = {2021}
+> }
+> ```
+
+## What this fork is
+
+This fork diverges from upstream with **CUDA performance work** on the GPU engine
+(modern arch targeting, multi-GPU peer access, batched source injection, blocked
+read-out and progress/sync, memory-footprint cleanup). The numerical scheme is
+unchanged: forward results match the reference Python engine to machine accuracy.
+These changes are **not submitted upstream** and are maintained here independently.
+
+Performance work is tuned on the hardware I run it on:
+
+- **NVIDIA RTX 4500 Ada Generation** (24 GB, dedicated VRAM) — the workstation baseline.
+- **NVIDIA DGX Spark (GB10 Grace-Blackwell)** — aarch64, 128 GB unified memory.
+
+The two targets differ in memory behaviour: dedicated VRAM fails hard on
+over-allocation, whereas the GB10's unified memory degrades gradually. Memory
+budgeting is therefore queried at **runtime** (free VRAM via `cudaMemGetInfo` minus
+an adaptive safety margin) rather than hard-coded — the engine discovers the GPU it
+is running on and adapts, instead of assuming a fixed device at build time.
+
+## Relationship to `dg-acoustics`
+
+In parallel I develop **`dg-acoustics`**, a separate and independent acoustic
+simulation engine. The two projects are **not** the same code and serve different
+roles:
+
+- **PFFDTD (this fork)** is a *forward* FDTD solver on Cartesian / FCC grids. It
+  computes room impulse responses for a given geometry and set of boundary
+  impedances. It is fast and well-validated for that purpose, and I keep this fork
+  as a research and benchmarking instrument.
+
+- **`dg-acoustics`** is a **Discontinuous-Galerkin time-domain** wave solver built
+  for a different goal: **differentiable inverse design**. Beyond the forward
+  solution it provides a **locally-reacting impedance boundary with complex
+  frequency-dependent admittance**, a **certified adjoint**, and the machinery to
+  **invert for geometry and materials** rather than only simulate them. This is a
+  capability a pure forward FDTD code does not have by construction — the point is
+  not "a more accurate FDTD", it is a different class of tool (forward **and**
+  gradient-based design inversion).
+
+`dg-acoustics` is the production forward engine of my acoustics stack. This PFFDTD
+fork is kept separate and is **not** part of that production pipeline; it remains a
+standalone, independently-maintained derivative of Brian Hamilton's original work.
+
+---
+
 # PFFDTD (pretty fast FDTD)
 
 ![PFFDTD Screenshot](https://github.com/bsxfun/pffdtd/raw/main/screenshot.png)
