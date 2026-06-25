@@ -17,8 +17,19 @@ submittate a monte. dg-acoustics è motore separato di produzione: questo
 fork è strumento di ricerca/benchmark, non parte del pipeline di produzione.
 
 ## Regole di lavoro (NON negoziabili)
-- STEP 0 obbligatorio a inizio di ogni sprint: git log -1 --oneline --decorate
-  + git status --short + git branch --show-current. Mai assumere lo stato.
+- STEP 0 obbligatorio a inizio di ogni sessione/sprint, mai assumere lo stato:
+    git fetch origin
+    git log -1 --oneline --decorate
+    git status --short
+    git branch --show-current
+    git rev-list --left-right --count <branch>...origin/<branch>
+  Se il branch locale è DIETRO origin (conteggio destro > 0) ed è antenato
+  stretto (conteggio sinistro = 0): allinea con  git merge --ff-only origin/<branch>
+  PRIMA di qualsiasi lavoro. Se --ff-only fallisce (non sei antenato stretto):
+  STOP+REPORT, non forzare, non merge, non rebase senza ok esplicito.
+  Motivo: Stefano pusha dal Mac; la macchina di lavoro (GB10) può essere indietro.
+  Documentare o ottimizzare codice non presente nel tree locale è un errore
+  load-bearing.
 - Commit ATOMICI, Conventional Commits, NO "Co-authored-by: Claude".
 - NON pushare mai da Code. Push lo fa Stefano dal Mac.
 - Gate-fail su guardiani load-bearing → STOP+ROLLBACK, mai forzare.
