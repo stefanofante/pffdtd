@@ -77,6 +77,29 @@ roles:
   not "a more accurate FDTD", it is a different class of tool (forward **and**
   gradient-based design inversion).
 
+### Comparison
+
+| Dimension | PFFDTD (this fork) | dg-acoustics |
+|---|---|---|
+| Numerical method | Explicit FDTD, 7-pt Cartesian / 13-pt FCC stencil | Nodal Discontinuous Galerkin (Hesthaven-Warburton), LSERK4 |
+| Discretization | Structured voxel grid | Unstructured, body-conforming mesh |
+| Geometry | Staircase + surface-area correction | Conforming boundary; curved/angled walls without staircasing |
+| Boundary model | Frequency-dependent impedance (octave-band passive fit) | Locally-reacting one-pole ADE + multi-pole complex reflection fit; validated vs analytic R(theta) |
+| Modal observable | RIR only; descriptors extracted downstream | Damped complex modes s_m = -alpha_m + j*omega_m, native from the solver |
+| Inverse design | None, by construction (pure forward) | Certified adjoint: materials, matrix-free geometry, FWI, frequency continuation |
+| Differentiability | No | Yes; full forward + boundary chain differentiable |
+| Uncertainty | No | Conformal prediction + UQ module |
+| Role in stack | Cross-validation / benchmarking instrument | Production forward (<=250 Hz) + design-inversion engine |
+
+The distinction that matters is not speed: it is that **PFFDTD is a pure forward
+solver while dg-acoustics performs differentiable inverse design** — a different
+class of tool, not a faster version of the same one. dg-acoustics is currently
+implemented in Python + CuPy because that is where the maths and the design-inversion
+work are prototyped; its performance-critical kernels can be moved to C/CUDA if and
+when the forward path needs it, exactly as this fork already is. The two solvers rest
+on different numerical foundations (finite differences vs discontinuous Galerkin),
+which is what makes cross-validating one against the other worthwhile.
+
 `dg-acoustics` is the production forward engine of my acoustics stack. This PFFDTD
 fork is kept separate and is **not** part of that production pipeline; it remains a
 standalone, independently-maintained derivative of Brian Hamilton's original work.
