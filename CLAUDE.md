@@ -9,6 +9,8 @@ Regole assolute, valide su ogni commit e ogni output:
 - NIENTE emoji. Mai, né nei commit né nei file né nelle risposte.
 - NIENTE "Co-authored-by: Claude" o qualsiasi attribuzione AI nei commit.
 - Commit firmati solo da Stefano, messaggi Conventional Commits puri.
+- Tutto il contenuto del repo deve essere solo in inglese: codice, commenti,
+  identificatori, documentazione (README incluso) e messaggi di commit.
 
 ## Natura del repo
 Fork derivato di bsxfun/pffdtd (Brian Hamilton, MIT 2021), mantenuto da
