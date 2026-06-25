@@ -694,6 +694,25 @@ double run_sim(const struct SimData *sd)
       gds[gid].totalmembytes = print_gpu_details(gid); 
    }
 
+   //enable P2P peer access for multi-GPU halo exchanges (else memcpyPeer stages through host)
+   if (ngpus>1) {
+      for (int gid=0; gid<ngpus; gid++) {
+         gpuErrchk( cudaSetDevice(gid) );
+         for (int gjd=0; gjd<ngpus; gjd++) {
+            if (gid==gjd) continue;
+            int can=0;
+            cudaDeviceCanAccessPeer(&can, gid, gjd);
+            if (can) {
+               cudaError_t e = cudaDeviceEnablePeerAccess(gjd,0);
+               if (e!=cudaSuccess && e!=cudaErrorPeerAccessAlreadyEnabled)
+                  fprintf(stderr,"P2P enable %d->%d failed: %s (fallback host-staging)\n",gid,gjd,cudaGetErrorString(e));
+            } else {
+               fprintf(stderr,"P2P unavailable %d->%d (fallback host-staging)\n",gid,gjd);
+            }
+         }
+      }
+   }
+
    Real lo2 = sd->lo2;
    Real a1 = sd->a1;
    Real a2 = sd->a2;
