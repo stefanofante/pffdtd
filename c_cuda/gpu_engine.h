@@ -84,7 +84,9 @@ double run_sim(const struct SimData *sd);
 //CUDA kernels
 template<typename Idx>
 __global__ void KernelAirCart(Real * __restrict__ u0, const Real * __restrict__ u1, const uint8_t * __restrict__ bn_mask);
+template<typename Idx>
 __global__ void KernelAirFCC(Real * __restrict__ u0, const Real * __restrict__ u1, const uint8_t * __restrict__ bn_mask);
+template<typename Idx>
 __global__ void KernelFoldFCC(Real * __restrict__ u1);
 __global__ void KernelBoundaryRigidCart(Real * __restrict__ u0, const Real * __restrict__ u1,  
                                             const uint16_t * __restrict__ adj_bn,
@@ -254,27 +256,35 @@ __global__ void KernelAirCart(Real * __restrict__ u0, const Real * __restrict__ 
 }
 
 //air update for FCC, on folded grid (improvement to 2013 DAFx paper) 
-__global__ void KernelAirFCC(Real * __restrict__ u0, const Real * __restrict__ u1,  
+template<typename Idx>
+__global__ void KernelAirFCC(Real * __restrict__ u0, const Real * __restrict__ u1,
                                         const uint8_t * __restrict__ bn_mask)
 {
+   //B7: index type Idx (int32_t fast path when per-GPU grid fits, int64_t fallback).
+   //Only address arithmetic changes; FP order (ADD_O/FMA_D intrinsics) is identical.
+   //Max combined offset is ii + NxNy + Nx = Npts-2 < Npts, covered by the Npts<INT32_MAX guard.
+   const Idx Nx   = (Idx)cuNx;
+   const Idx Ny   = (Idx)cuNy;
+   const Idx Nz   = (Idx)cuNz;
+   const Idx NxNy = (Idx)cuNxNy;
    // get ix,iy,iz from thread and block Id's
-   int64_t cx = blockIdx.x*cuBx + threadIdx.x + 1;
-   int64_t cy = blockIdx.y*cuBy + threadIdx.y + 1;
-   int64_t cz = blockIdx.z*cuBz + threadIdx.z + 1;
-   if ((cx<cuNx-1) && (cy<cuNy-1) && (cz<cuNz-1)) {
+   Idx cx = blockIdx.x*cuBx + threadIdx.x + 1;
+   Idx cy = blockIdx.y*cuBy + threadIdx.y + 1;
+   Idx cz = blockIdx.z*cuBz + threadIdx.z + 1;
+   if ((cx<Nx-1) && (cy<Ny-1) && (cz<Nz-1)) {
       //x is contiguous
-      int64_t ii = cz*cuNxNy + cy*cuNx + cx;
+      Idx ii = cz*NxNy + cy*Nx + cx;
       Real tmp1,tmp2,tmp3,tmp4;
       //divide-conquer add as much as possible
-      tmp1 = ADD_O(u1[ii + cuNxNy + cuNx],u1[ii - cuNxNy - cuNx]);
-      tmp2 = ADD_O(u1[ii + cuNx + 1],u1[ii - cuNx - 1]);
+      tmp1 = ADD_O(u1[ii + NxNy + Nx],u1[ii - NxNy - Nx]);
+      tmp2 = ADD_O(u1[ii + Nx + 1],u1[ii - Nx - 1]);
       tmp1 = ADD_O(tmp1,tmp2);
-      tmp3 = ADD_O(u1[ii + cuNxNy + 1],u1[ii - cuNxNy - 1]);
-      tmp4 = ADD_O(u1[ii + cuNxNy - cuNx],u1[ii - cuNxNy + cuNx]);
+      tmp3 = ADD_O(u1[ii + NxNy + 1],u1[ii - NxNy - 1]);
+      tmp4 = ADD_O(u1[ii + NxNy - Nx],u1[ii - NxNy + Nx]);
       tmp3 = ADD_O(tmp3,tmp4);
-      tmp2 = ADD_O(u1[ii + cuNx - 1],u1[ii - cuNx + 1]);
+      tmp2 = ADD_O(u1[ii + Nx - 1],u1[ii - Nx + 1]);
       tmp1 = ADD_O(tmp1,tmp2);
-      tmp4 = ADD_O(u1[ii + cuNxNy - 1],u1[ii - cuNxNy + 1]);
+      tmp4 = ADD_O(u1[ii + NxNy - 1],u1[ii - NxNy + 1]);
       tmp3 = ADD_O(tmp3,tmp4);
       tmp1 = ADD_O(tmp1,tmp3);
       tmp1 = FMA_D(c1,u1[ii],FMA_D(c2,tmp1,-u0[ii]));
@@ -286,13 +296,19 @@ __global__ void KernelAirFCC(Real * __restrict__ u0, const Real * __restrict__ u
 }
 
 //this folds in half of FCC subgrid so everything is nicely homogenous (no braching for stencil)
+template<typename Idx>
 __global__ void KernelFoldFCC(Real * __restrict__ u1)
 {
-   int64_t cx = blockIdx.x*cuBx2 + threadIdx.x; 
-   int64_t cz = blockIdx.y*cuBy2 + threadIdx.y;
+   //B7: shares the air index space (max cz*NxNy+(Ny-1)*Nx+cx = Npts-1 < Npts) -> same Idx/guard.
+   const Idx Nx   = (Idx)cuNx;
+   const Idx Ny   = (Idx)cuNy;
+   const Idx Nz   = (Idx)cuNz;
+   const Idx NxNy = (Idx)cuNxNy;
+   Idx cx = blockIdx.x*cuBx2 + threadIdx.x;
+   Idx cz = blockIdx.y*cuBy2 + threadIdx.y;
    //fold is along middle dimension
-   if ((cx<cuNx) && (cz<cuNz)) {
-      u1[cz*cuNxNy + (cuNy-1)*cuNx + cx] = u1[cz*cuNxNy + (cuNy-2)*cuNx + cx];
+   if ((cx<Nx) && (cz<Nz)) {
+      u1[cz*NxNy + (Ny-1)*Nx + cx] = u1[cz*NxNy + (Ny-2)*Nx + cx];
    }
 }
 
@@ -1041,7 +1057,7 @@ double run_sim(const struct SimData *sd)
    //B7: report which air-stencil index path is used per GPU (32-bit fast path vs 64-bit fallback)
    for (int gid=0; gid < ngpus; gid++) {
       bool use32 = (ghds[gid].Npts < INT32_MAX);
-      printf("GPU %d: KernelAirCart index path = %s (Npts=%ld, INT32_MAX=%d)\n",
+      printf("GPU %d: air/fold index path = %s (Npts=%ld, INT32_MAX=%d)\n",
              gid, use32 ? "int32" : "int64 (fallback)", (long)ghds[gid].Npts, INT32_MAX);
       assert(use32 || sizeof(int64_t)==8); //int64 fallback always valid; guard documents intent
    }
@@ -1065,7 +1081,13 @@ double run_sim(const struct SimData *sd)
             KernelBoundaryRigidCart<<<gd->grid_dim_bn,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
          }
          else {
-            KernelFoldFCC<<<gd->grid_dim_fold,gd->block_dim_fold,0,gd->cuStream_bn>>>(gd->u1);
+            //B7: fold shares the air index space -> same int32/int64 guard
+            if (ghd->Npts < INT32_MAX) {
+               KernelFoldFCC<int32_t><<<gd->grid_dim_fold,gd->block_dim_fold,0,gd->cuStream_bn>>>(gd->u1);
+            }
+            else {
+               KernelFoldFCC<int64_t><<<gd->grid_dim_fold,gd->block_dim_fold,0,gd->cuStream_bn>>>(gd->u1);
+            }
             KernelBoundaryRigidFCC<<<gd->grid_dim_bn,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
          }
          //using buffer to then update FD boundaries
@@ -1111,7 +1133,13 @@ double run_sim(const struct SimData *sd)
             }
          }
          else {
-            KernelAirFCC<<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
+            //B7: 32-bit index path when per-GPU grid fits (Npts<INT32_MAX), else int64 fallback
+            if (ghd->Npts < INT32_MAX) {
+               KernelAirFCC<int32_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
+            }
+            else {
+               KernelAirFCC<int64_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
+            }
          }
          //boundary ABC loss
          KernelBoundaryABC<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u0,gd->u2ba,gd->Q_bna,gd->bna_ixyz);
