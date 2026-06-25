@@ -102,6 +102,7 @@ __global__ void KernelBoundaryFD(Real * __restrict__ u0b, const Real *u2b,
                                   const Real * ssaf_bnl, const int8_t * mat_bnl,
                                   const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads);
 __global__ void AddIn(Real *u0, Real sample);
+__global__ void AddInBatch(Real * __restrict__ u0, const int64_t * __restrict__ in_ixyz, const double * __restrict__ in_sigs, int64_t Ns, int64_t Nt, int64_t n);
 __global__ void CopyToGridKernel(Real *u, const Real *buffer,  const int64_t *locs, int64_t N);
 __global__ void CopyFromGridKernel(Real *buffer, const Real *u,  const int64_t *locs, int64_t N);
 __global__ void FlipHaloXY_Zbeg(Real * __restrict__ u1);
@@ -145,6 +146,8 @@ struct gpuData { //for or on gpu (arrays all on GPU)
    int64_t *bna_ixyz;
    int8_t *Q_bna;
    int64_t *out_ixyz;
+   int64_t *in_ixyz;
+   double *in_sigs;
    uint16_t *adj_bn;
    Real *ssaf_bnl; 
    uint8_t  *bn_mask;
@@ -415,6 +418,15 @@ __global__ void KernelBoundaryFD(Real * __restrict__ u0b, const Real *u2b,
 __global__ void AddIn(Real *u0, Real sample)
 {
    u0[0] += sample;
+}
+
+//batched source injection: one thread per source (indices strictly increasing => distinct, no atomics)
+//in_sigs is stored RAW on device; negation lives only here (single point of sign)
+__global__ void AddInBatch(Real * __restrict__ u0, const int64_t * __restrict__ in_ixyz,
+                           const double * __restrict__ in_sigs, int64_t Ns, int64_t Nt, int64_t n)
+{
+   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   if (i<Ns) u0[in_ixyz[i]] += (Real)(-in_sigs[i*Nt+n]);
 }
 
 //dst-src copy from buffer to grid
@@ -889,6 +901,13 @@ double run_sim(const struct SimData *sd)
       gpuErrchk( cudaMalloc(&(gd->out_ixyz), (size_t)(ghd->Nr*sizeof(int64_t))) );
       gpuErrchk( cudaMemcpy(gd->out_ixyz, ghd->out_ixyz, (size_t)ghd->Nr*sizeof(int64_t), cudaMemcpyHostToDevice) );
 
+      //batched source injection buffers (in_sigs stored RAW, negation only in kernel)
+      gpuErrchk( cudaMalloc(&(gd->in_ixyz), (size_t)(ghd->Ns*sizeof(int64_t))) );
+      gpuErrchk( cudaMemcpy(gd->in_ixyz, ghd->in_ixyz, (size_t)ghd->Ns*sizeof(int64_t), cudaMemcpyHostToDevice) );
+
+      gpuErrchk( cudaMalloc(&(gd->in_sigs), (size_t)(ghd->Ns*sd->Nt*sizeof(double))) );
+      gpuErrchk( cudaMemcpy(gd->in_sigs, ghd->in_sigs, (size_t)ghd->Ns*sd->Nt*sizeof(double), cudaMemcpyHostToDevice) );
+
       gpuErrchk( cudaMalloc(&(gd->adj_bn), (size_t)(ghd->Nb*sizeof(uint16_t))) );    
       gpuErrchk( cudaMemcpy(gd->adj_bn, ghd->adj_bn, (size_t)ghd->Nb*sizeof(uint16_t), cudaMemcpyHostToDevice) );
 
@@ -1059,9 +1078,9 @@ double run_sim(const struct SimData *sd)
          FlipHaloYZ_Xbeg<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
          FlipHaloYZ_Xend<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
 
-         //injecting source first, negating sample to add it in first (NB source on different stream than bn)
-         for (int64_t ns=0; ns<ghd->Ns; ns++) {
-            AddIn<<<1,1,0,gd->cuStream_air>>>(gd->u0 + ghd->in_ixyz[ns],(Real)(-(ghd->in_sigs[ns*sd->Nt+n]))); 
+         //injecting source first, negation done inside kernel (NB source on different stream than bn)
+         if (ghd->Ns>0) {
+            AddInBatch<<<CU_DIV_CEIL(ghd->Ns,cuBrw),cuBrw,0,gd->cuStream_air>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,n);
          }
          //now air updates (not conflicting with bn updates because of bn_mask)
          if (sd->fcc_flag==0) {
@@ -1232,6 +1251,8 @@ double run_sim(const struct SimData *sd)
       gpuErrchk( cudaFree(gd->u0) );
       gpuErrchk( cudaFree(gd->u1) );
       gpuErrchk( cudaFree(gd->out_ixyz) );
+      gpuErrchk( cudaFree(gd->in_ixyz) );
+      gpuErrchk( cudaFree(gd->in_sigs) );
       gpuErrchk( cudaFree(gd->bn_ixyz) );
       gpuErrchk( cudaFree(gd->bnl_ixyz) );
       gpuErrchk( cudaFree(gd->bna_ixyz) );
