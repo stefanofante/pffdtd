@@ -81,7 +81,8 @@ uint64_t print_gpu_details(int i);
 void check_sorted(const struct SimData *sd);
 void split_data(const struct SimData *sd, struct gpuHostData *ghds, int ngpus);
 double run_sim(const struct SimData *sd);
-//CUDA kernels 
+//CUDA kernels
+template<typename Idx>
 __global__ void KernelAirCart(Real * __restrict__ u0, const Real * __restrict__ u1, const uint8_t * __restrict__ bn_mask);
 __global__ void KernelAirFCC(Real * __restrict__ u0, const Real * __restrict__ u1, const uint8_t * __restrict__ bn_mask);
 __global__ void KernelFoldFCC(Real * __restrict__ u1);
@@ -221,21 +222,28 @@ uint64_t print_gpu_details(int i) {
 //NB. 'x' is contiguous dim in CUDA domain
 
 //vanilla scheme, unrolled, intrinsics to control rounding errors
-__global__ void KernelAirCart(Real * __restrict__ u0, const Real * __restrict__ u1,  
+template<typename Idx>
+__global__ void KernelAirCart(Real * __restrict__ u0, const Real * __restrict__ u1,
                                             const uint8_t * __restrict__ bn_mask)
 {
-   int64_t cx = blockIdx.x*cuBx + threadIdx.x + 1;
-   int64_t cy = blockIdx.y*cuBy + threadIdx.y + 1;
-   int64_t cz = blockIdx.z*cuBz + threadIdx.z + 1;
-   if ((cx<cuNx-1) && (cy<cuNy-1) && (cz<cuNz-1)) {
-      int64_t ii = cz*cuNxNy + cy*cuNx + cx;
+   //B7: index type Idx (int32_t fast path when per-GPU grid fits, int64_t fallback).
+   //Only address arithmetic changes; FP order (ADD_O/FMA_D intrinsics) is identical.
+   const Idx Nx   = (Idx)cuNx;
+   const Idx Ny   = (Idx)cuNy;
+   const Idx Nz   = (Idx)cuNz;
+   const Idx NxNy = (Idx)cuNxNy;
+   Idx cx = blockIdx.x*cuBx + threadIdx.x + 1;
+   Idx cy = blockIdx.y*cuBy + threadIdx.y + 1;
+   Idx cz = blockIdx.z*cuBz + threadIdx.z + 1;
+   if ((cx<Nx-1) && (cy<Ny-1) && (cz<Nz-1)) {
+      Idx ii = cz*NxNy + cy*Nx + cx;
       //divide-conquer add for better accuracy
       Real tmp1,tmp2;
-      tmp1 = ADD_O(u1[ii + cuNxNy],u1[ii - cuNxNy]);
-      tmp2 = ADD_O(u1[ii + cuNx],u1[ii - cuNx]);
+      tmp1 = ADD_O(u1[ii + NxNy],u1[ii - NxNy]);
+      tmp2 = ADD_O(u1[ii + Nx],u1[ii - Nx]);
       tmp1 = ADD_O(tmp1,tmp2);
       tmp2 = ADD_O(u1[ii + 1],u1[ii - 1]);
-      tmp1 = ADD_O(tmp1,tmp2); 
+      tmp1 = ADD_O(tmp1,tmp2);
       tmp1 = FMA_D(c1,u1[ii],FMA_D(c2,tmp1,-u0[ii]));
 
       //write final value back to global memory
@@ -1030,6 +1038,14 @@ double run_sim(const struct SimData *sd)
    gpuErrchk( cudaEventCreate(&cuEv_main_sample_start) );
    gpuErrchk( cudaEventCreate(&cuEv_main_sample_end) );
 
+   //B7: report which air-stencil index path is used per GPU (32-bit fast path vs 64-bit fallback)
+   for (int gid=0; gid < ngpus; gid++) {
+      bool use32 = (ghds[gid].Npts < INT32_MAX);
+      printf("GPU %d: KernelAirCart index path = %s (Npts=%ld, INT32_MAX=%d)\n",
+             gid, use32 ? "int32" : "int64 (fallback)", (long)ghds[gid].Npts, INT32_MAX);
+      assert(use32 || sizeof(int64_t)==8); //int64 fallback always valid; guard documents intent
+   }
+
    for (int64_t n=0; n<sd->Nt; n++) { //loop over time-steps
       for (int gid=0; gid < ngpus; gid++) { //loop over GPUs (one thread launches all kernels)
          gpuErrchk( cudaSetDevice(gid) );
@@ -1086,7 +1102,13 @@ double run_sim(const struct SimData *sd)
          }
          //now air updates (not conflicting with bn updates because of bn_mask)
          if (sd->fcc_flag==0) {
-            KernelAirCart<<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
+            //B7: 32-bit index path when per-GPU grid fits (Npts<INT32_MAX), else int64 fallback
+            if (ghd->Npts < INT32_MAX) {
+               KernelAirCart<int32_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
+            }
+            else {
+               KernelAirCart<int64_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
+            }
          }
          else {
             KernelAirFCC<<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
