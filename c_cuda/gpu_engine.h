@@ -760,9 +760,10 @@ double run_sim(const struct SimData *sd)
    int64_t Nx_pos=0;
    //uint64_t Nx_pos2=0;
 
+   const int READOUT_BLOCK = 512; //drain receiver outputs in blocks (fewer D2H transfers + syncs)
    Real *u_out_buf; 
-   gpuErrchk( cudaMallocHost(&u_out_buf, (size_t)(sd->Nr*sizeof(Real))) );
-   memset(u_out_buf, 0, (size_t)(sd->Nr*sizeof(Real))); //set floats to zero
+   gpuErrchk( cudaMallocHost(&u_out_buf, (size_t)(sd->Nr*READOUT_BLOCK*sizeof(Real))) );
+   memset(u_out_buf, 0, (size_t)(sd->Nr*READOUT_BLOCK*sizeof(Real))); //set floats to zero
 
    int64_t Nzy = (sd->Nz)*(sd->Ny); //area-slice 
 
@@ -802,7 +803,7 @@ double run_sim(const struct SimData *sd)
       ghd->K_bn      = sd->K_bn + Nb_read;
       ghd->Q_bna     = sd->Q_bna + Nba_read;
       ghd->u_out     = sd->u_out + Nr_read*sd->Nt;
-      ghd->u_out_buf = u_out_buf + Nr_read;
+      ghd->u_out_buf = u_out_buf + Nr_read*READOUT_BLOCK;
 
       //recalculate indices, these are associated host versions to copy over to devices
       mymalloc((void **)&(ghd->bn_ixyz), ghd->Nb*sizeof(int64_t));
@@ -883,8 +884,8 @@ double run_sim(const struct SimData *sd)
       gpuErrchk( cudaMalloc(&(gd->gh1), (size_t)(ghd->Nbl*MMb*sizeof(Real))) );
       gpuErrchk( cudaMemset(gd->gh1, 0, (size_t)(ghd->Nbl*MMb*sizeof(Real))) );
 
-      gpuErrchk( cudaMalloc(&(gd->u_out_buf), (size_t)(ghd->Nr*sizeof(Real))) );
-      gpuErrchk( cudaMemset(gd->u_out_buf, 0, (size_t)(ghd->Nr*sizeof(Real))) );
+      gpuErrchk( cudaMalloc(&(gd->u_out_buf), (size_t)(ghd->Nr*READOUT_BLOCK*sizeof(Real))) );
+      gpuErrchk( cudaMemset(gd->u_out_buf, 0, (size_t)(ghd->Nr*READOUT_BLOCK*sizeof(Real))) );
 
       gpuErrchk( cudaMalloc(&(gd->bn_ixyz), (size_t)(ghd->Nb*sizeof(int64_t))) );
       gpuErrchk( cudaMemcpy(gd->bn_ixyz, ghd->bn_ixyz, (size_t)ghd->Nb*sizeof(int64_t), cudaMemcpyHostToDevice) );
@@ -1093,22 +1094,28 @@ double run_sim(const struct SimData *sd)
          KernelBoundaryABC<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u0,gd->u2ba,gd->Q_bna,gd->bna_ixyz);
          gpuErrchk( cudaEventRecord(gd->cuEv_air_end,gd->cuStream_air) ); //for timing
 
-         //readouts
-         CopyFromGridKernel<<<gd->grid_dim_readout,gd->block_dim_readout,0,gd->cuStream_bn>>>(gd->u_out_buf, gd->u1, gd->out_ixyz, ghd->Nr);
-         //then async memory copy of outputs (not really async because on same stream as CopyFromGridKernel)
-         gpuErrchk( cudaMemcpyAsync(ghd->u_out_buf, gd->u_out_buf, ghd->Nr*sizeof(Real), cudaMemcpyDeviceToHost, gd->cuStream_bn) );
+         //readouts (write into block column col; drain D2H in batches of READOUT_BLOCK steps)
+         int64_t col = n % READOUT_BLOCK;
+         CopyFromGridKernel<<<gd->grid_dim_readout,gd->block_dim_readout,0,gd->cuStream_bn>>>(gd->u_out_buf + col*ghd->Nr, gd->u1, gd->out_ixyz, ghd->Nr);
          gpuErrchk( cudaEventRecord(gd->cuEv_readout_end,gd->cuStream_bn) );
       }
 
-      //readouts
-      for (int gid=0; gid < ngpus; gid++) {
-         gpuErrchk( cudaSetDevice(gid) );
-         struct gpuData *gd = &(gds[gid]);
-         struct gpuHostData *ghd = &(ghds[gid]);
-         gpuErrchk( cudaEventSynchronize(gd->cuEv_readout_end) ); 
-         //copy grid points off output buffer
-         for (int64_t nr=0; nr<ghd->Nr; nr++) {
-            ghd->u_out[nr*sd->Nt + n] = (double)(ghd->u_out_buf[nr]);
+      //readouts: drain only at block boundary (or last step) -> single D2H of filled columns
+      if ( (n % READOUT_BLOCK)==(READOUT_BLOCK-1) || n==sd->Nt-1 ) {
+         int64_t ncol = (n % READOUT_BLOCK) + 1; //filled columns in this block
+         int64_t base = n - (ncol-1);            //global step of first column
+         for (int gid=0; gid < ngpus; gid++) {
+            gpuErrchk( cudaSetDevice(gid) );
+            struct gpuData *gd = &(gds[gid]);
+            struct gpuHostData *ghd = &(ghds[gid]);
+            gpuErrchk( cudaMemcpyAsync(ghd->u_out_buf, gd->u_out_buf, (size_t)(ghd->Nr*ncol*sizeof(Real)), cudaMemcpyDeviceToHost, gd->cuStream_bn) );
+            gpuErrchk( cudaStreamSynchronize(gd->cuStream_bn) );
+            //despancio: host buffer laid out [col*Nr + nr]
+            for (int64_t c=0; c<ncol; c++) {
+               for (int64_t nr=0; nr<ghd->Nr; nr++) {
+                  ghd->u_out[nr*sd->Nt + (base+c)] = (double)(ghd->u_out_buf[c*ghd->Nr + nr]);
+               }
+            }
          }
       }
       //synchronise streams
