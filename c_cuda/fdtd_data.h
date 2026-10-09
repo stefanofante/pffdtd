@@ -877,16 +877,46 @@ void print_last_samples(struct SimData *sd) {
 
 //scale input to be in middle of floating-point range 
 void scale_input(struct SimData *sd) {
+   if (sd == NULL) {
+      fprintf(stderr,"Input scaling: missing simulation data.\n");
+      exit(EXIT_FAILURE);
+   }
    double *in_sigs = sd->in_sigs;
    int64_t Nt = sd->Nt;
    int64_t Ns = sd->Ns;
+   if (Ns < 0 || Nt <= 0 || (Ns > 0 && Nt > INT64_MAX/Ns)) {
+      fprintf(stderr,"Input scaling: invalid or overflowing source/sample counts (Ns=%lld, Nt=%lld).\n",
+              (long long)Ns,(long long)Nt);
+      exit(EXIT_FAILURE);
+   }
+   const int64_t input_count = Ns*Nt;
+   if ((uint64_t)input_count > SIZE_MAX/sizeof(double) || (input_count > 0 && in_sigs == NULL)) {
+      fprintf(stderr,"Input scaling: source storage is missing or exceeds addressable bytes.\n");
+      exit(EXIT_FAILURE);
+   }
+   if (input_count == 0) {
+      sd->infac = 1.0;
+      printf("No input sources, input scaling is identity (infac = 1).\n");
+      return;
+   }
 
    //normalise input signals (and save gain)
    double max_in = 0.0;
    for (int64_t n=0; n<Nt; n++) {
       for (int64_t ns=0; ns<Ns; ns++) {
+          if (!isfinite(in_sigs[(int64_t)ns*Nt+n])) {
+             fprintf(stderr,"Input scaling: nonfinite input at source %lld, sample %lld.\n",
+                     (long long)ns,(long long)n);
+             exit(EXIT_FAILURE);
+          }
           max_in = MAX(max_in,fabs(in_sigs[(int64_t)ns*Nt+n]));
       }
+   }
+   if (max_in == 0.0) {
+      // Preserve zero input and its signs; no gain or output rescaling is needed.
+      sd->infac = 1.0;
+      printf("max_in = 0, input scaling is identity (infac = 1).\n");
+      return;
    }
    double aexp = 0.5; //normalise to middle power of two
    int32_t pow2 = (int32_t)round(aexp*REAL_MAX_EXP+(1-aexp)*REAL_MIN_EXP);
@@ -894,6 +924,11 @@ void scale_input(struct SimData *sd) {
    double norm1 = pow(2.0,pow2);
    double inv_infac = norm1/max_in;
    double infac = 1.0/inv_infac;
+   if (!isfinite(inv_infac) || inv_infac <= 0.0 || !isfinite(infac) || infac <= 0.0) {
+      fprintf(stderr,"Input scaling: positive finite gains cannot represent max_in=%.16e "
+              "(inv_infac=%.16e, infac=%.16e).\n",max_in,inv_infac,infac);
+      exit(EXIT_FAILURE);
+   }
 
    printf("max_in = %.16e, pow2 = %d, norm1 = %.16e, inv_infac = %.16e, infac = %.16e\n",max_in,pow2,norm1,inv_infac,infac);
 

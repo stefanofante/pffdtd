@@ -365,3 +365,92 @@ CUDA post e driver230 confronti compilati per Ada/GB10; runtime SKIP77.
 **Aperto:** gate device/Compute Sanitizer, confronto RIR e prestazioni dei due
 target; preparazione mesh/FCC/fitting, filtri aria opzionali e WAV nativi.
 Il FIR analitico ha costo elevato per tap: valutare polyphase/LUT dopo gate.
+
+---
+
+## 2026-10-09 — Mesh/FCC e materiali esistenti nel preparatore nativo
+**Contesto:** la preparazione analitica non copriva le mesh reali del repository.
+**Modifiche:** `fdtd_prepare.cpp`, geometria FP64/BVH piatto condivisi CPU/CUDA,
+griglia e interpolazione8corner, permutazioni/fold FCC, import DEF passivi,
+sorgente bilineare, scrittura esclusiva dei cinque HDF5 e loader originale.
+CUDA mantiene mesh/assi residenti, batch262144 e CUB Flagged stabile; ritorna
+solo boundary compatte, con budget memoria, staging pinned e lifetime espliciti.
+Preflight sorgente/ricevitori prima del volume, bit reciproci verificati anche
+dopo layout. Kelvin, somma di ogni link nel SAF e unione reciproca dei tagli
+sono correzioni intenzionali; endpoint aggiunti rigidi, senza cascata artificiale.
+**Razionale:** completare la preparazione senza calcolo Python, ridurre il costo
+da scansioni per triangolo a query BVH e limitare memoria/trasferimenti device.
+**Esito:** PASS75570 check mesh,58485 griglia,140791 preparazione/7 round trip
+HDF5; strict e ASan/UBSan. CTK Cart/FCC h=.15 e Musikverein FCC h=.05 con
+DEF reali superano geometria/reciprocità/loader. Musikverein ha32120 triangoli,
+2372701 boundary e128 corner; griglie più grossolane che tagliano ricevitori
+sono rifiutate. CUDA sm89/sm121 compila; classifier74/72 registri, stack/spill0.
+Devicegate80 scene con41898 record CPU, runtimeCUDA SKIP77.
+**Aperto:** convergenza spaziale/RIR, gate device e prestazioni per target;
+fitting di nuove assorbenze e piani di batch sovrapposti richiedono nuovi gate.
+I DEF importati consentono già l'intera pipeline senza eseguire fitter Python.
+
+---
+
+## 2026-10-09 — Aria nativa e filtro modale FFT con bound
+**Contesto:** Stokes, OLA e modal erano ancora stadi numerici Python; modal
+usa una ricorrenza quadratica dipendente dal modo.
+**Modifiche:** ISO9613 con pressione reale; FFT/DCT native radix2/Bluestein;
+backendCUDA Stokes gather senza atomiche, OLA cuFFT batch128/gather ordinato,
+modal per modo e IDCT cuFFT. DSP→aria conserva i campioni sul device.
+ModalFFT opzionale usa nodi Chebyshev, K FFT pesate, somma compensata e bound
+analitico tramite norma L1; batch8 CUDA, nessuna matriceN*K. Fallback alla
+ricorrenza per costo/range/bound sfavorevoli; q0 calcolato direttamente.
+**Razionale:** passare da O(Nin*Nout) a O(K*Nout*logNout) controllando l'errore
+d'interpolazione. Una convoluzione stazionaria non sostituisce questi operatori.
+**Esito:** PASS195863 check aria/FFT e ASan/UBSan;8 record lunghi fino8192,
+Kmax25, maxerroreFFT5.382e-14 contro stato long-double, ricorrenza double
+1.521e-10. PASS18219661 check host dei piani kernel Stokes/OLA/IDCT,
+batch/tail/bypass/stride e mutanti, anche sanitizer. CUDA Ada/GB10 compilato;
+driver con operatori isolati e pipeline residente pronto, runtime SKIP77.
+**Aperto:** bound riguarda interpolazione, esclude roundoff/convergenza fisica.
+OLA preserva il primo tap legacy7/6 a assorbimento nullo; non è identità.
+Misure cuFFT/IIR/aria e gate device restano da eseguire su entrambe le GPU.
+
+---
+
+## 2026-10-09 — Pipeline reale fino a HDF5 e WAV
+**Contesto:** il core post nativo non esportava audio né applicava aria.
+**Modifiche:** CLI aria/atmosfera/tolerance/modal-method, HDF5 con metadati,
+WAV float32 RIFF/fact, peak globale, silenzio sicuro, guardie e pubblicazione
+esclusiva con rollback dei propri file. Il post legge Tc/rh e controlla la
+pipelineCPU intera con --verifyCUDA. HDF5 pubblicato prima dei WAV, errore
+WAV segnala l'HDF5 già esistente. Guida nativa con mapping reali e build.
+**Razionale:** rendere usabile JSONmesh→prepare→forward→post→WAV in C++/CUDA.
+**Esito:** PASS29 casi WAV strict/sanitizer e integrazione CLI/atmosfera/alias.
+CTK reale Cart h=.15/Nt1537, CPUFP32OMP2, sei ricevitori: OLA6x19456@48k,
+Stokes6x3101@8k, modalFFT6x3099@8k. Checker indipendente strict/sanitizer:
+227712 campioni HDF5 finiti, ogni canale nonzero; raw9222 campioni bit-exact
+dai48corner;12WAV/233472 float32 bit-exact,938159 verifiche. Peak0.0078166.
+CTK FCC folded/unfolded Nt1537 originalCPUFP64:73776 campioni finiti,
+maxdelta5.122e-11/RMSnormalizzato7.80e-15, gatepointwise1e-10+rel1e-11 PASS.
+FP32 RMSnormalizzato3.13e-6 raw e1.35e-3 dopoHP/LP; gatepointwise1e-6+rel1e-3
+fallito, nessun allargamento post-hoc. FP64 filtrato maxdelta9.37e-15 e
+RMSnormalizzato4.24e-12. Il fold cambia l'ordine delle addizioni, senza claim
+bitwise o equivalenza acusticaFP32; entrambi i post producono6x1537 finiti.
+Bootstrap nativo include JSON,cuFFT SHA-pinned e tutte le build/test per
+sm89/sm121. Le28 esecuzioni CUDA test/benchmark/post/prepare restituiscono
+77 senza creare output: assenza del device, mai PASS o misura di speedup.
+**Aperto:** stabilità lunga, RIR misurate e runtime/prestazioni CUDA;
+pubblicazione della bozza cloud e fresh-task restoration non verificate.
+
+---
+
+## 2026-10-09 — Normalizzazione zero e dati invalidi
+**Contesto:** max_in0 causava gain infinito e campioni NaN anche per silenzio;
+NaN/Inf non venivano rifiutati, conteggi potevano traboccare prima dell'indice.
+**Modifiche:** `scale_input` controlla dati/count/storage/gain, mantiene zero
+con infac1 e signedzero, rifiuta fattori non rappresentabili con diagnosi.
+La sequenza aritmetica per sorgenti finite normali rimane invariata.
+**Razionale:** silenzio e dati invalidi devono avere comportamento definito
+prima del solver; evitare NaN che contaminano tutte le celle e l'output.
+**Esito:** PASS almeno18964 check per precisione,18 fatalcases inchild e forwardCPU
+zero Cart/FCC1/FCC2; strict e ASan/UBSan/leaks FP32/FP64. Gain e campioni
+normali confrontati bit-exact col riferimento precedente.
+**Aperto:** amplitudesubnormaliche richiedono fattore infinito sono rifiutate;
+nessuna modifica allo schema FDTD o claim di prestazioni CUDA.

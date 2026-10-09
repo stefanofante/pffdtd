@@ -66,8 +66,12 @@ discontinuous-Galerkin wave engine method-against-method.
 ## Optimizations applied vs upstream
 
 The following changes have been made to the GPU engine relative to
-[bsxfun/pffdtd](https://github.com/bsxfun/pffdtd). The numerical scheme is
-unchanged; forward output matches the reference Python engine to machine accuracy.
+[bsxfun/pffdtd](https://github.com/bsxfun/pffdtd). Forward optimizations retain
+the Cartesian/FCC update scheme. The latest native preparation also corrects
+sound speed, reciprocal links and surface factors; see the compatibility rules
+in [the native guide](docs/NATIVE_PIPELINE.md) and the evidence in
+[the CUDA audit](docs/CUDA_AUDIT.md). CUDA runtime and performance gates for the
+new variants require execution on each target GPU.
 
 - **Build target.** Upstream compiled for `sm_35` (Kepler), which runs in
   PTX-JIT compatibility mode on modern GPUs. Now `-arch=native` plus
@@ -90,10 +94,11 @@ Performance work is tuned on the hardware it runs on:
 - **NVIDIA DGX Spark (GB10 Grace-Blackwell)** — aarch64, 128 GB unified memory.
 
 The two targets differ in memory behaviour: Ada has dedicated VRAM, whereas GB10
-shares physical memory with the host. The engine currently uses `cudaMalloc` and
-reports device capacity; it does not yet query free memory or enforce a safety
-budget before allocation. Scene sizing must leave room for the host and driver,
-especially on GB10. Shared physical memory does not imply managed-memory paging.
+shares physical memory with the host. The engine uses `cudaMalloc` and checks its
+explicit allocation budget against `cudaMemGetInfo` before allocating fields.
+Runtime/Graph overhead and other host allocations need additional room,
+especially on GB10; the check does not reserve memory or adapt partitions.
+Shared physical memory does not imply managed-memory paging.
 
 ## Relationship to `dg-acoustics`
 
@@ -132,9 +137,15 @@ the other worthwhile.
 
 ## Build & run
 
-PFFDTD runs on Linux with the CUDA toolkit and HDF5. To build the engines, run
-`make all` in the `c_cuda` folder (see the Makefile for HDF5 paths). The Python side
-needs Python 3.9+ with the packages in `pip_requirements.txt` (or the conda env).
+The native pipeline imports JSONRoomExport meshes and existing passive HDF5
+materials, prepares Cartesian/FCC solver inputs, runs the forward engine, and
+processes RIRs through filters, resampling, air attenuation and WAV export.
+See [the native pipeline guide](docs/NATIVE_PIPELINE.md) for complete commands.
+Numerical stages use C++/CUDA; the legacy Python tools remain available separately.
+
+Build on Linux with HDF5, a C++ compiler, nlohmann/json headers, and a compatible
+CUDA toolkit with cuFFT. CUDA preparation uses C++17 for CUB. Run `make all
+prepare post` in `c_cuda` (see the Makefile for library paths).
 
 Use `CUDA_ARCH=sm_89` for RTX 4500 Ada or `CUDA_ARCH=sm_121` for GB10 with a
 compatible toolkit. The default remains `native`. GPU code for GB10 can be

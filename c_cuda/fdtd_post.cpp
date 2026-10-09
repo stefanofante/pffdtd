@@ -1,8 +1,11 @@
 // Native receiver reconstruction, filtering and resampling of solver HDF5 output.
 #include <hdf5.h>
 #include <post_pipeline.h>
+#include <post_air.h>
+#include <post_wav.h>
 #ifdef __CUDACC__
 #include <post_cuda.h>
+#include <post_air_cuda.h>
 #endif
 
 #include <algorithm>
@@ -28,7 +31,7 @@
 namespace {
 
 struct Options {
-   std::string directory, output;
+   std::string directory, output, wav_directory;
 #ifdef __CUDACC__
    std::string backend = "cuda";
 #else
@@ -36,7 +39,8 @@ struct Options {
 #endif
    std::string iir_mode = "serial";
    pffdtd_post::PostOptions processing;
-   bool overwrite = false, verify = false, save_raw = false;
+   pffdtd_post::AirOptions air;
+   bool overwrite = false, verify = false, save_raw = false, save_wav = false;
 };
 
 void require(bool condition, const std::string &message)
@@ -66,17 +70,29 @@ void usage(const char *program)
                "  --lowpass-order N      Default 8\n"
                "  --symmetric-lowpass    Apply low-pass forward and backward\n"
                "  --sample-rate HZ       Output rate; default 48000, 0 preserves native rate\n"
+               "  --air-filter MODE      none|stokes|ola|modal; default none\n"
+               "  --air-window N         OLA window samples; default 1024\n"
+               "  --air-pressure KPA     Atmospheric pressure; default 101.325\n"
+               "  --air-stokes-db DB     Stokes truncation level; default 120\n"
+               "  --air-modal-pad SEC    Modal tail padding; default 0\n"
+               "  --air-modal-method MODE recurrence|fft; default recurrence\n"
+               "  --air-modal-tolerance X  FFT truncation error bound; default 1e-12\n"
                "  --verify               Compare CUDA with CPU: abs 1e-12 + rel 1e-8\n"
                "  --save-raw             Also write reconstructed r_out\n"
+               "  --save-wav             Export float32 receiver WAV files\n"
+               "  --wav-dir DIR          WAV destination; default data directory\n"
                "  --overwrite            Explicitly replace an existing regular output file\n"
                "  --help\n\n"
                "Reads comms_out.h5/out_alpha[Nmic,K], sim_consts.h5/Ts and\n"
                "sim_outs.h5/u_out[Nmic*K,Nt]. u_out is already reordered and rescaled\n"
                "by the solver. diff=1 enables integration before receiver filtering.\n"
                "Writes r_out_f[Nmic,Nt_out] and scalar Fs_f through atomic publication.\n"
-               "Air absorption: none. The native Kaiser resampler differs from resampy;\n"
+               "Processing order: receiver weights, integration/high-pass, resampling,\n"
+               "low-pass, air absorption, optional WAV export. Air temperature/humidity\n"
+               "come from sim_consts.h5/Tc and rh; defaults 20 C and 50 percent.\n"
+               "The native Kaiser resampler differs from resampy;\n"
                "the processed waveform is not expected to match its samples bit for bit.\n"
-               "No Python calculations, plotting or WAV export. CUDA absence returns 77\n"
+               "CUDA absence returns 77\n"
                "before creating output files. CPU --verify validates the reference result.\n",
                program,
 #ifdef __CUDACC__
@@ -117,10 +133,14 @@ bool parse(int argc, char **argv, Options &options)
       if (arg == "--overwrite") options.overwrite = true;
       else if (arg == "--verify") options.verify = true;
       else if (arg == "--save-raw") options.save_raw = true;
+      else if (arg == "--save-wav") options.save_wav = true;
       else if (arg == "--symmetric-lowpass") options.processing.symmetric_lowpass = true;
       else if (arg == "--data-dir" || arg == "--output" || arg == "--backend" || arg == "--iir-mode" ||
                arg == "--lowcut" || arg == "--lowpass" || arg == "--sample-rate" ||
-               arg == "--lowcut-order" || arg == "--lowpass-order") {
+               arg == "--lowcut-order" || arg == "--lowpass-order" || arg == "--wav-dir" ||
+               arg == "--air-filter" || arg == "--air-window" || arg == "--air-pressure" ||
+               arg == "--air-stokes-db" || arg == "--air-modal-pad" ||
+               arg == "--air-modal-method" || arg == "--air-modal-tolerance") {
          require(++i<argc,"Missing value for "+arg);
          if (arg == "--data-dir") options.directory = argv[i];
          else if (arg == "--output") {
@@ -129,6 +149,17 @@ bool parse(int argc, char **argv, Options &options)
          }
          else if (arg == "--backend") options.backend = argv[i];
          else if (arg == "--iir-mode") options.iir_mode = argv[i];
+         else if (arg == "--wav-dir") {
+            require(argv[i][0] != '\0',"--wav-dir requires a nonempty directory path");
+            options.wav_directory = argv[i];
+         }
+         else if (arg == "--air-filter") options.air.mode = argv[i];
+         else if (arg == "--air-window") options.air.window = order(argv[i],arg.c_str());
+         else if (arg == "--air-pressure") options.air.pressure = number(argv[i],arg.c_str());
+         else if (arg == "--air-stokes-db") options.air.stokes_db = number(argv[i],arg.c_str());
+         else if (arg == "--air-modal-pad") options.air.modal_pad = number(argv[i],arg.c_str());
+         else if (arg == "--air-modal-method") options.air.modal_method = argv[i];
+         else if (arg == "--air-modal-tolerance") options.air.modal_tolerance = number(argv[i],arg.c_str());
          else if (arg == "--lowcut") options.processing.lowcut = number(argv[i],arg.c_str());
          else if (arg == "--lowpass") options.processing.lowpass = number(argv[i],arg.c_str());
          else if (arg == "--sample-rate") options.processing.output_rate = number(argv[i],arg.c_str());
@@ -141,6 +172,15 @@ bool parse(int argc, char **argv, Options &options)
    require(options.backend == "cpu" || options.backend == "cuda","--backend must be cpu or cuda");
    require(options.iir_mode == "serial" || options.iir_mode == "chunked","--iir-mode must be serial or chunked");
    require(options.backend != "cpu" || options.iir_mode == "serial","Chunked IIR requires the CUDA backend");
+   options.air.mode = pffdtd_post::air_mode(options.air);
+   require(options.air.pressure > 0 && options.air.pressure <= 200,"--air-pressure must be in (0,200] kPa");
+   require(options.air.stokes_db > 0,"--air-stokes-db must be positive");
+   require(options.air.window >= 4,"--air-window must contain at least four samples");
+   require(options.air.modal_method == "recurrence" || options.air.modal_method == "fft",
+           "--air-modal-method must be recurrence or fft");
+   require(options.air.modal_tolerance > 0,"--air-modal-tolerance must be positive");
+   require(options.wav_directory.empty() || options.save_wav,"--wav-dir requires --save-wav");
+   if (options.wav_directory.empty()) options.wav_directory = options.directory;
    if (options.output.empty()) options.output = join(options.directory,"sim_outs_processed.h5");
    require(options.output.back() != '/',"Output must name a file");
    return true;
@@ -233,6 +273,7 @@ struct Inputs {
    std::vector<double> data, weights;
    size_t channels, corners, samples;
    double fs;
+   double temperature = 20.0, humidity = 50.0;
    bool differentiated;
 };
 
@@ -261,6 +302,11 @@ Inputs load(const Options &options)
    require(ts>0,"Ts must be positive");
    input.fs = 1/ts;
    require(std::isfinite(input.fs) && input.fs>0,"Native sample rate is invalid");
+   const htri_t has_temperature = H5Lexists(constants,"Tc",H5P_DEFAULT);
+   const htri_t has_humidity = H5Lexists(constants,"rh",H5P_DEFAULT);
+   require(has_temperature >= 0 && has_humidity >= 0,"Cannot inspect air metadata in sim_consts.h5");
+   if (has_temperature) input.temperature = scalar_double(constants,"Tc");
+   if (has_humidity) input.humidity = scalar_double(constants,"rh");
 
    H5Handle outputs(H5Fopen(join(options.directory,"sim_outs.h5").c_str(),H5F_ACC_RDONLY,H5P_DEFAULT),
                      H5Fclose,"Cannot open sim_outs.h5");
@@ -419,23 +465,37 @@ int run(Options options)
    }
    Inputs input = load(options);
    options.processing.integrate = input.differentiated;
+   options.air.temperature = input.temperature;
+   options.air.humidity = input.humidity;
    check_destination(options);
    const auto start = std::chrono::steady_clock::now();
    pffdtd_post::PostResult result;
-   if (options.backend == "cpu")
+   if (options.backend == "cpu") {
       result = pffdtd_post::process_cpu(input.data,input.weights,input.channels,input.corners,input.samples,input.fs,options.processing);
+      if (options.air.mode != "none") {
+         auto air = pffdtd_post::process_air_cpu(result.filtered,result.channels,result.samples_out,result.fs_out,options.air);
+         result.filtered.swap(air.data);
+         result.samples_out = air.samples;
+      }
+   }
 #ifdef __CUDACC__
    else result = pffdtd_post::process_cuda(input.data,input.weights,input.channels,input.corners,input.samples,input.fs,
-                                         options.processing,options.iir_mode == "chunked",options.verify);
+                                         options.processing,options.iir_mode == "chunked",options.verify,&options.air);
 #endif
    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
    validate_result(result,input);
    if (options.verify && options.backend == "cuda") {
-      const auto reference = pffdtd_post::process_cpu(input.data,input.weights,input.channels,input.corners,input.samples,input.fs,options.processing);
+      auto reference = pffdtd_post::process_cpu(input.data,input.weights,input.channels,input.corners,input.samples,input.fs,options.processing);
+      if (options.air.mode != "none") {
+         auto reference_air = pffdtd_post::process_air_cpu(reference.filtered,reference.channels,reference.samples_out,
+                                                         reference.fs_out,options.air);
+         reference.filtered.swap(reference_air.data);
+         reference.samples_out = reference_air.samples;
+      }
       validate_result(reference,input);
       require(result.samples_out == reference.samples_out && result.fs_out == reference.fs_out,"Verification metadata mismatch");
       compare(result.raw,reference.raw,"receiver reconstruction");
-      compare(result.filtered,reference.filtered,"filtered/resampled output");
+      compare(result.filtered,reference.filtered,"filtered/resampled/air output");
    }
    else if (options.verify) std::printf("Verify: CPU reference dimensions and finite samples PASS.\n");
    AtomicOutput output(options);
@@ -454,7 +514,15 @@ int run(Options options)
       write_string(file,"iir_mode",options.iir_mode.c_str());
       write_string(file,"resampler",result.fs_out == input.fs ? "identity" : "kaiser_sinc_analytic_v1");
       write_string(file,"build_revision",PFFDTD_BUILD_REVISION);
-      write_string(file,"air_filter","none");
+      write_string(file,"air_filter",options.air.mode.c_str());
+      write_scalar(file,"air_temperature",options.air.temperature);
+      write_scalar(file,"air_humidity",options.air.humidity);
+      write_scalar(file,"air_pressure",options.air.pressure);
+      write_scalar(file,"air_stokes_db",options.air.stokes_db);
+      write_scalar(file,"air_modal_pad",options.air.modal_pad);
+      write_string(file,"air_modal_method",options.air.modal_method.c_str());
+      write_scalar(file,"air_modal_tolerance",options.air.modal_tolerance);
+      write_integer(file,"air_window",static_cast<int64_t>(options.air.window));
       if (options.save_raw) {
          write_matrix(file,"r_out",result.raw,result.channels,result.samples);
       }
@@ -462,10 +530,40 @@ int run(Options options)
       file.close();
    }
    output.publish(options);
+   std::vector<std::string> wav_paths;
+   if (options.save_wav) {
+      try {
+         // --output can name any file. Prevent --overwrite WAV publication
+         // from replacing the HDF5 result when its name aliases a receiver WAV.
+         struct stat hdf_output;
+         require(stat(options.output.c_str(),&hdf_output) == 0,"Cannot inspect published HDF5 output");
+         double peak = 0;
+         for (double value : result.filtered) peak = std::max(peak,std::fabs(value));
+         for (size_t channel = 0; channel < result.channels; ++channel) {
+            char receiver[64];
+            const int count = std::snprintf(receiver,sizeof(receiver),"R%03zu_out",channel+1);
+            require(count > 0 && static_cast<size_t>(count) < sizeof(receiver),"WAV filename is not representable");
+            for (unsigned kind = 0; kind < (peak < 1 ? 2u : 1u); ++kind) {
+               const std::string filename = std::string(receiver)+(kind ? "_native.wav" : "_normalised.wav");
+               struct stat destination;
+               if (stat(join(options.wav_directory,filename.c_str()).c_str(),&destination) == 0)
+                  require(destination.st_dev != hdf_output.st_dev || destination.st_ino != hdf_output.st_ino,
+                          "WAV destination aliases the HDF5 result; choose another --output path");
+            }
+         }
+         wav_paths = pffdtd_post::export_wav(options.wav_directory,result.filtered,result.channels,
+                                             result.samples_out,result.fs_out,options.overwrite);
+      }
+      catch (const std::exception &error) {
+         throw std::runtime_error("HDF5 published to "+options.output+"; WAV export failed: "+error.what());
+      }
+   }
    std::printf("Processed %zu receivers: %zu samples at %.17g Hz -> %zu samples at %.17g Hz; "
-               "backend=%s, iir=%s, integrate=%d, air=none, process_wall=%.9fs\nOutput: %s\n",
+               "backend=%s, iir=%s, integrate=%d, air=%s, process_wall=%.9fs\nOutput: %s\n",
                input.channels,input.samples,input.fs,result.samples_out,result.fs_out,
-               options.backend.c_str(),options.iir_mode.c_str(),input.differentiated ? 1 : 0,seconds,options.output.c_str());
+               options.backend.c_str(),options.iir_mode.c_str(),input.differentiated ? 1 : 0,
+               options.air.mode.c_str(),seconds,options.output.c_str());
+   for (const std::string &path : wav_paths) std::printf("WAV: %s\n",path.c_str());
    return 0;
 }
 

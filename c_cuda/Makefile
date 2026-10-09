@@ -19,6 +19,9 @@ NVCC = nvcc
 IDIR = .
 BUILD_DIR ?= .
 CUDA_ARCH ?= native
+JSON_INC ?= /usr/include
+CUFFT_LIB ?= /usr/local/cuda/lib64
+CUFFT_LDFLAGS ?= -L$(CUFFT_LIB) -lcufft -Xlinker -rpath -Xlinker $(CUFFT_LIB)
 BUILD_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)$(if $(shell git status --porcelain --untracked-files=no 2>/dev/null),-dirty,)
 
 #set the HDF5 env variables for your system
@@ -67,13 +70,23 @@ benchmark: benchmark_double benchmark_single
 
 post: post_cpu post_gpu
 
+prepare: prepare_cpu prepare_gpu
+
+prepare_cpu:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O3 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) -I$(JSON_INC) fdtd_prepare.cpp -o $(BUILD_DIR)/fdtd_prepare_cpu.x -DPRECISION=2 -DUSING_CUDA=false -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(LDFLAGS)
+
+prepare_gpu:
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --fmad=false -I$(JSON_INC) fdtd_prepare.cpp -o $(BUILD_DIR)/fdtd_prepare_gpu.x -DPRECISION=2 -DUSING_CUDA=true -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(CULDFLAGS)
+
 post_cpu:
 	mkdir -p $(BUILD_DIR)
-	$(CXX) -std=c++11 -O3 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) fdtd_post.cpp -o $(BUILD_DIR)/fdtd_post_cpu.x -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(LDFLAGS)
+	$(CXX) -std=c++14 -O3 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) fdtd_post.cpp -o $(BUILD_DIR)/fdtd_post_cpu.x -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(LDFLAGS)
 
 post_gpu:
 	mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) -std=c++11 --fmad=false fdtd_post.cpp -o $(BUILD_DIR)/fdtd_post_gpu.x -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(CULDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++14 --fmad=false fdtd_post.cpp -o $(BUILD_DIR)/fdtd_post_gpu.x -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(CULDFLAGS) $(CUFFT_LDFLAGS)
 
 benchmark_double:
 	mkdir -p $(BUILD_DIR)
@@ -156,6 +169,13 @@ test-memory-launch:
 	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -I$(IDIR) ../tests/native/memory_launch_test.cpp -o $(BUILD_DIR)/memory_launch_test.x
 	$(BUILD_DIR)/memory_launch_test.x
 
+test-input-scaling:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/input_scaling_test.cpp -o $(BUILD_DIR)/input_scaling_single_test.x -DPRECISION=1 -DUSING_CUDA=false $(LDFLAGS)
+	$(BUILD_DIR)/input_scaling_single_test.x
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/input_scaling_test.cpp -o $(BUILD_DIR)/input_scaling_double_test.x -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
+	$(BUILD_DIR)/input_scaling_double_test.x
+
 test-post:
 	mkdir -p $(BUILD_DIR)
 	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/post_dsp_test.cpp -o $(BUILD_DIR)/post_dsp_test.x
@@ -165,11 +185,47 @@ test-post:
 	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/post_pipeline_test.cpp -o $(BUILD_DIR)/post_pipeline_test.x
 	$(BUILD_DIR)/post_pipeline_test.x
 
-test-native: test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-fixture test-memory-launch test-post
+test-grid:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/prepare_grid_test.cpp -o $(BUILD_DIR)/prepare_grid_test.x
+	$(BUILD_DIR)/prepare_grid_test.x
+
+test-mesh:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/mesh_geometry_test.cpp -o $(BUILD_DIR)/mesh_geometry_test.x
+	$(BUILD_DIR)/mesh_geometry_test.x
+
+test-prepare:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) -I$(JSON_INC) fdtd_prepare.cpp ../tests/native/prepare_scene_test.cpp -o $(BUILD_DIR)/prepare_scene_test.x -DPFFDTD_PREPARE_NO_MAIN -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
+	pffdtd_prepare_parent=$$(mktemp -d "$(BUILD_DIR)/prepare-check.XXXXXX") && \
+	$(BUILD_DIR)/prepare_scene_test.x "$$pffdtd_prepare_parent/suite"
+
+test-air:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/post_air_test.cpp -o $(BUILD_DIR)/post_air_test.x
+	$(BUILD_DIR)/post_air_test.x
+
+test-air-plan:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/air_cuda_plan_test.cpp -o $(BUILD_DIR)/air_cuda_plan_test.x
+	$(BUILD_DIR)/air_cuda_plan_test.x
+
+# Air regression includes direct FFT/DCT checks and FFT-versus-recurrence modal.
+test-fft: test-air
+
+test-wav:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) ../tests/native/post_wav_test.cpp -o $(BUILD_DIR)/post_wav_test.x
+	$(BUILD_DIR)/post_wav_test.x
+
+test-native: test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-fixture test-memory-launch test-input-scaling test-post test-grid test-mesh test-prepare test-air test-air-plan test-fft test-wav
 
 build-cuda-tests:
 	mkdir -p $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) -std=c++11 --fmad=false ../tests/post_cuda_check.cu -o $(BUILD_DIR)/post_cuda_test.x $(CULDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++14 --fmad=false ../tests/post_cuda_check.cu -o $(BUILD_DIR)/post_cuda_test.x $(CULDFLAGS) $(CUFFT_LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++14 --fmad=false ../tests/post_air_cuda_check.cu -o $(BUILD_DIR)/post_air_cuda_test.x $(CULDFLAGS) $(CUFFT_LDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++17 --fmad=false -I$(JSON_INC) fdtd_prepare.cpp ../tests/prepare_cuda_check.cu -o $(BUILD_DIR)/prepare_cuda_test.x -DPFFDTD_PREPARE_NO_MAIN -DPRECISION=2 -DUSING_CUDA=false $(CULDFLAGS)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/native/halo_faces_test.cpp -o $(BUILD_DIR)/halo_faces_cuda_test.x
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_fd_cuda_check.cu -o $(BUILD_DIR)/boundary_fd_single_cuda_test.x -DPRECISION=1 -DUSING_CUDA=true $(CULDFLAGS)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_fd_cuda_check.cu -o $(BUILD_DIR)/boundary_fd_double_cuda_test.x -DPRECISION=2 -DUSING_CUDA=true $(CULDFLAGS)
@@ -181,6 +237,8 @@ build-cuda-tests:
 # Tests return 77 when no CUDA device is visible; preserve that result.
 test-cuda: build-cuda-tests
 	$(BUILD_DIR)/post_cuda_test.x
+	$(BUILD_DIR)/post_air_cuda_test.x
+	$(BUILD_DIR)/prepare_cuda_test.x
 	$(BUILD_DIR)/halo_faces_cuda_test.x
 	$(BUILD_DIR)/boundary_fd_single_cuda_test.x
 	$(BUILD_DIR)/boundary_fd_double_cuda_test.x
@@ -189,7 +247,7 @@ test-cuda: build-cuda-tests
 	$(BUILD_DIR)/boundary_stencil_single_cuda_test.x
 	$(BUILD_DIR)/boundary_stencil_double_cuda_test.x
 
-.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single benchmark benchmark_double benchmark_single post post_cpu post_gpu fixture test-fixture test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-native test-memory-launch test-post build-cuda-tests test-cuda clean
+.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single benchmark benchmark_double benchmark_single post post_cpu post_gpu prepare prepare_cpu prepare_gpu fixture test-fixture test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-native test-memory-launch test-input-scaling test-post test-grid test-mesh test-prepare test-air test-air-plan test-fft test-wav build-cuda-tests test-cuda clean
 
 clean:
 	rm -f $(BUILD_DIR)/*.x

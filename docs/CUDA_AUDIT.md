@@ -2,6 +2,15 @@
 
 Analisi del 9 ottobre 2026, commit `ad169d2e9e13b5072236fbe1b5bdda023a743501`, coincidente con `origin/develop` al momento dell'ispezione. Obiettivo: calcolo nativo C++/CUDA, inclusi preparazione e post-elaborazione; nessuna simulazione o elaborazione numerica Python eseguita.
 
+Stato dopo gli interventi: il percorso JSON mesh/materiali DEF → preparazione
+Cart/FCC → forward → DSP/resampling/aria → HDF5/WAV è disponibile in C++/CUDA.
+La preparazione usa BVH residente e compattazione stabile; il filtro modale ha
+una variante FFT con errore d'interpolazione controllato. Sono passati test
+nativi e prove su mesh reali. Le build sm_89/sm_121 sono verificabili su questo
+host; esecuzione CUDA, speedup e validazione acustica sulle due GPU rimangono
+da misurare. I finding iniziali sotto sono conservati come contesto storico;
+gli aggiornamenti successivi specificano cosa è stato corretto.
+
 ## Valutazione
 
 Il forward CUDA è una base sensata: accessi contigui nel bulk, FCC ripiegato, due campi della pressione, stato delle impedenze in struttura per polo, input caricati una volta, output a blocchi, indici bulk a 32 bit quando sicuri. Non conviene sostituire tutto contemporaneamente e perdere il riferimento numerico. Conviene riscrivere progressivamente scheduler, boundary e pipeline completa; valutare un nuovo discretizzatore come ramo separato con un contratto di accuratezza.
@@ -254,4 +263,132 @@ PASS576 design contro TF analogica/bilineare indipendente,108 ricorrenze fino655
 - [vox_scene.py:632](../python/voxelizer/vox_scene.py#L632) verifica reciprocità con `assert ~(bitA ^ bitB)` su interi: ~0=−1 e ~1=−2 sono entrambi veri. La verifica non rileva mismatch. Il ramo FCC del link3 usa inoltre il vicino positivo anziché negativo e non applica correttamente il passo della parità. Il port deve interrogare link canonici e aggiornare entrambi gli estremi, verificando uguaglianza dei bit opposti.
 - L'assorbenza Sabine non determina univocamente fase e impedenza. La riduzione dei poli richiede obiettivo fisico e passività/convergenza; importare e verificare i DEF esistenti permette di portare prepare prima di riscrivere il fitter.
 
-Questi finding provengono dall'ispezione del codice, senza eseguire calcoli Python. Preparazione generale mesh/FCC/materiali, filtri aria opzionali e WAV non sono ancora migrati. Stokes è un kernel gaussiano dipendente dal tempo; OLA e modal sono operatori distinti. Una semplice convoluzione FFT non è una sostituzione equivalente: il port richiede gate dedicati.
+Questi finding provengono dall'ispezione del codice, senza eseguire calcoli
+Python. Sono affrontati nel port nativo descritto di seguito. Stokes è un
+kernel gaussiano dipendente dal tempo; OLA e modal sono operatori distinti.
+Una semplice convoluzione FFT non è una sostituzione equivalente.
+
+### Preparazione di mesh reali in C++/CUDA
+
+`fdtd_prepare.cpp` importa JSONRoomExport in metri, triangoli, sides, materiali,
+sorgenti e ricevitori. Importa e valida i DEF HDF5 passivi esistenti, con al
+massimo12 rami; non deduce una nuova impedenza complessa dall'assorbenza Sabine.
+La velocità del suono usa Kelvin e conserva il margine CFL0.999; FP32 richiede
+la sorgente differenziata con la vera ricorrenza bilineare. I corner di
+interpolazione devono restare fuori boundary/ABC, anche quando il peso è zero.
+Il preflight dei corner precede la voxelizzazione dell'intero volume: griglie
+inadeguate ricevono una diagnosi col ricevitore, senza spostarlo automaticamente.
+
+`mesh_geometry.h` precomputa FP64 e costruisce un BVH piatto con escape link,
+foglie4 e ordinali deterministici. Una traversal per nodo valuta6/12 link,
+riutilizzando il triangolo. I bounds conservativi includono l'allargamento
+dei test sui bordi dei triangoli acuti; la distanza firmata dal piano evita
+la cancellazione fra lunghezze nella soglia near. Gli axis array originali
+sono condivisi fra CPU e CUDA: ricostruire coordinate con aritmetica diversa
+potrebbe cambiare le classificazioni vicine alle soglie.
+
+Il backend CUDA mantiene geometria e assi residenti, classifica batch fino
+a262144 candidati interni e salta i nodi FCC dispari prima della traversal.
+CUB Flagged conserva l'ordine e restituisce solo boundary compatte, con
+staging pinned e aritmetica/memoria/lanci controllati. Non alloca un record
+per ogni cella della griglia. I due fence per batch proteggono conteggio e
+staging; una futura pipeline doppia deve dimostrare i tempi di riuso dei
+buffer. CUDA13 CUB richiede C++17. Il compilatore riporta74 registri Ada e72
+GB10 per classifier, senza stack/spill: non sono prestazioni osservate.
+
+La riconciliazione taglia un link da entrambi gli estremi se almeno uno lo
+classifica bloccato. Gli endpoint aggiunti diventano rigidi; non propagano
+artificialmente un'isolazione completa ad altri nodi. Il controllo finale
+richiede bit opposti uguali anche dopo permutazione e folding FCC. Il SAF
+somma separatamente ogni link bloccato: due versi opposti contribuiscono2,
+correggendo l'addizione booleana del legacy. Kelvin, SAF e near/link reciproci
+sono correzioni intenzionali; non si promette bit equality con Python.
+
+`prepare_grid.h` conserva gli8 pesi/corner legacy, permutazioni, parity FCC,
+riflessione delle direzioni nel fold e receiver reorder inverso con duplicati.
+CPU FCC accetta sia la griglia fisica sia il fold; CUDA usa FCC flag2 ripiegato.
+Cinque HDF5 sono pubblicati in una directory esclusivamente nuova e verificati
+dal loader originale. PASS75570 check mesh,58485 griglia,140791 preparazione
+e7 round trip HDF5, anche ASan/UBSan. I gate CUDA coprono80 scene e code di
+batch; il confronto dei record sul device richiede hardware.
+
+Mesh reali con materiali del repository: CTK h=.15m Cart/FCC supera il loader;
+Musikverein FCC h=.05m supera geometria/reciprocità/loader con32120 triangoli,
+2372701 boundary e128 corner ricevitore. h=.15/.1/.075 per Musikverein è
+rifiutato perché i corner di alcuni ricevitori intersecano la mesh: non è un
+errore da aggirare. Queste sono prove del port, non frequenze consigliate
+o certificazioni della convergenza spaziale delle RIR.
+
+### Aria nativa e sostituzione del costo quadratico modale
+
+`post_air.h` implementa ISO9613, Stokes, OLA e modal. La pressione reale entra
+nella concentrazione relativa del vapore e nelle frequenze di rilassamento;
+il legacy la fissava alla pressione standard. Stokes usa scatter crescente
+nel riferimento CPU e gather per output CUDA, senza atomiche floating point.
+OLA usa FFT native radix2/Bluestein sulla CPU e cuFFT FP64 sulla GPU, batch
+limitati a128 frame e overlap-add per output con ordine dei frame esplicito.
+La finestra legacy dei frame iniziali dist<0 è conservata: a assorbimento
+zero il primo tap ha gain7/6 per window1024. Non è un bypass identità e non
+va confuso con un nuovo modello di propagazione passivo.
+
+La ricorrenza modal standard costa O(Nin*Nout), parallelizzabile per modo ma
+ancora quadratica. `--air-modal-method fft` interpola il Fourier transform
+smorzato `Zq(sigma)=sum_n x[n]*exp(-sigma*n-i*pi*q*n/Nout)` aK nodi Chebyshev
+Lobatto. I coefficienti della ricorrenza combinano parte reale e immaginaria;
+q0 usa direttamente la somma/sqrt(Nout). K FFT di lunghezza2Nout portano il
+costo a O(K*Nout*log Nout), evitando una matriceNout*K. La GPU usa batch8 e
+somma compensata per modo; una piccola riduzione L1 consente il planning del
+bound. I dati del post restano sul device fra DSP e aria.
+
+Il bound conservativo della coda Chebyshev usa
+`4*exp(hypot(a,K)-a-K*asinh(K/a))`, con `a=(Nin-1)*sigma_max/2`, e norme L1
+e guadagni IDCT per limitare l'errore assoluto d'interpolazione richiesto.
+Si mantiene il fallback alla ricorrenza per costo/range/bound sfavorevoli;
+la tolleranza non copre roundoff FFT, coefficienti o convergenza fisica.
+Il numero di nodi non è fissato arbitrariamente. Questa è un'approssimazione
+controllata dell'operatore modale, non una convoluzione stazionaria.
+
+PASS195863 controlli aria/FFT con riferimenti DFT/stato long-double indipendenti
+e ASan/UBSan. Otto record lunghi1025..8192 richiedono al massimo25 nodi:
+FFTmodal max5.382e-14 contro riferimento long-double, ricorrenza double
+max1.521e-10. Sono errori numerici, non speedup. Il modello host dei kernel
+gather/batch/spectrum supera18219661 check e sanitizer, rilevando mutanti
+con tail/bypass omessi e fase IDCT errata. Il driver CUDA confronta operatori
+isolati e pipeline residente, inclusi prime lengths/tail e prefilling NaN.
+
+### HDF5 e WAV della pipeline completa
+
+La CLI mantiene ordine HP/integratore → resample → LP → aria → WAV; legge
+Tc/rh dal preparatore, salva atmosfera/metodo/requested tolerance e dimensioni
+finali. `--verify` CUDA confronta la pipeline CPU completa. `post_wav.h`
+esporta IEEE float32 mono RIFF/fact, normalizzazione globale e native quando
+peak<1; il silenzio resta finito. Collisioni, alias, symlink e limiti RIFF32
+sono errori espliciti; la pubblicazione esclusiva ha rollback dei propri file.
+L'HDF5 è pubblicato prima dei WAV; un errore WAV segnala che l'HDF5 esiste già.
+PASS29 casi WAV strict/sanitizer e integrazione dei metadati atmosferici.
+
+Prova reale CTK: preparazione Cart h=.15/Nt1537/Ns8/Nr48, forward CPU FP32,
+sei ricevitori postprocessati con OLA48k/LP1400, Stokes8k e modalFFT8k, più
+WAV. Il checker indipendente strict/sanitizer verifica227712 campioni HDF5
+finiti,9222 raw pesati bit-exact e12WAV/233472 float32 bit-exact. CTK FCC
+folded/unfolded Nt1537, CPUFP64: maxdelta5.122e-11 e RMS normalizzato7.80e-15,
+PASS per campione1e-10+1e-11*abs(reference). FP32 ha RMS normalizzato3.13e-6
+sul raw e1.35e-3 sulla RIR HP/LP filtrata; la cancellazione del Nyquist rende
+più visibile il rounding. Il gate FP32 pointwise1e-6+rel1e-3 fallisce e non
+viene allargato dopo la prova. FP64 filtrato ha maxdelta9.37e-15 e RMS
+normalizzato4.24e-12. Il fold permuta l'ordine delle addizioni: questi risultati
+non sostituiscono stabilità lunga, RIR misurate o gate CUDA.
+Le istruzioni complete e i mapping dei materiali sono in
+[NATIVE_PIPELINE.md](NATIVE_PIPELINE.md). Fitting da nuove assorbenze, temporal
+blocking, output asincrono e scelta delle varianti sul device restano lavoro
+distinto; non occorre Python per usare la pipeline con i DEF del repository.
+
+### Normalizzazione della sorgente senza NaN
+
+`scale_input` ora gestisce sorgenti tutte nulle con gain identità, preservando
+anche signed zero; la simulazione mantiene pressione zero. Conteggi overflow,
+storage mancante, NaN/Inf e guadagni non rappresentabili sono errori espliciti.
+Le sorgenti normali mantengono esattamente ordine/arithmetic precedenti.
+PASS almeno18964 verifiche per precisione,18 errori in processi figli e forwardCPU
+Cart/FCC/fold con sorgenti nulle; ASan/UBSan passati. I subnormali che richiedono
+un fattore infinito sono rifiutati, senza normalizzazione silenziosa arbitraria.

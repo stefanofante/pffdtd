@@ -5,52 +5,14 @@
 #ifdef __CUDACC__
 #include "post_pipeline.h"
 #include "post_chunked.h"
+#include "post_cuda_common.h"
+#include "post_air_cuda.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>
 #include <string>
 
 namespace pffdtd_post {
-
-inline void post_cuda_check(cudaError_t status)
-{
-   if (status!=cudaSuccess)
-      throw std::runtime_error(std::string("CUDA postprocessing: ")+cudaGetErrorString(status));
-}
-
-class PostCudaBuffer {
-   double* pointer=nullptr;
-public:
-   explicit PostCudaBuffer(std::size_t count)
-   { if (count) post_cuda_check(cudaMalloc(&pointer,post_product(count,1)*sizeof(double))); }
-   ~PostCudaBuffer() { if (pointer) cudaFree(pointer); }
-   double* get() const { return pointer; }
-   PostCudaBuffer(const PostCudaBuffer&)=delete;
-   PostCudaBuffer& operator=(const PostCudaBuffer&)=delete;
-};
-
-class PostCudaStream {
-   cudaStream_t stream=nullptr;
-public:
-   PostCudaStream() { post_cuda_check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)); }
-   ~PostCudaStream() {
-      // Also fence queued work on exceptional paths, before buffer destruction.
-      if (stream) { cudaStreamSynchronize(stream); cudaStreamDestroy(stream); }
-   }
-   operator cudaStream_t() const { return stream; }
-   PostCudaStream(const PostCudaStream&)=delete;
-   PostCudaStream& operator=(const PostCudaStream&)=delete;
-};
-
-inline unsigned post_cuda_grid(std::size_t count, const cudaDeviceProp& properties)
-{
-   if (!count || properties.maxThreadsPerBlock<256)
-      throw std::invalid_argument("Invalid CUDA postprocessing launch size");
-   const std::size_t blocks=(count-1)/256+1;
-   if (blocks>static_cast<std::size_t>(properties.maxGridSize[0]))
-      throw std::invalid_argument("Postprocessing grid exceeds CUDA device limit");
-   return static_cast<unsigned>(blocks);
-}
 
 __global__ void PostRecombine(const double* input, const double* weights,
       double* output, std::size_t channels, std::size_t corners, std::size_t samples)
@@ -174,7 +136,8 @@ __global__ void PostResample(const double* input, double* output,
 inline PostResult process_cuda(const std::vector<double>& input,
       const std::vector<double>& weights, std::size_t channels,
       std::size_t corners, std::size_t samples, double fs,
-      const PostOptions& options, bool chunked, bool check_writes=false)
+      const PostOptions& options, bool chunked, bool check_writes=false,
+      const AirOptions* air=nullptr)
 {
    validate_post_input(input,weights,channels,corners,samples,fs,options);
    post_cuda_check(cudaSetDevice(0));
@@ -184,13 +147,17 @@ inline PostResult process_cuda(const std::vector<double>& input,
    const std::size_t samples_out=resample_length(samples,fs,fs_out);
    const std::size_t count=post_product(channels,samples);
    const std::size_t count_out=post_product(channels,samples_out);
+   const bool has_air=air && air_mode(*air)!="none";
+   const std::size_t final_samples=has_air ? air_output_samples(samples_out,fs_out,*air) : samples_out;
+   const std::size_t final_count=post_product(channels,final_samples);
    const unsigned raw_grid=post_cuda_grid(count,properties);
    const unsigned out_grid=post_cuda_grid(count_out,properties);
    PostResult result;
-   result.channels=channels; result.samples=samples; result.samples_out=samples_out; result.fs_out=fs_out;
-   result.raw.resize(count); result.filtered.resize(count_out);
+   result.channels=channels; result.samples=samples; result.samples_out=final_samples; result.fs_out=fs_out;
+   result.raw.resize(count); result.filtered.resize(final_count);
    PostCudaBuffer raw(input.size()), alpha(weights.size()), data(count);
    PostCudaBuffer resampled(fs_out!=fs ? count_out : 0);
+   PostCudaBuffer air_output(has_air ? final_count : 0);
    const std::size_t max_samples=std::max(samples,samples_out);
    const std::size_t scratch_count=chunked ?
       post_product(post_product(channels,(max_samples-1)/POST_IIR_CHUNK+1),2) : 0;
@@ -226,7 +193,11 @@ inline PostResult process_cuda(const std::vector<double>& input,
    if (options.symmetric_lowpass)
       filter_cuda(processed,channels,samples_out,lowpass,true,chunked,properties,stream,
          reinterpret_cast<PostState*>(response.get()),reinterpret_cast<PostState*>(initial.get()));
-   post_cuda_check(cudaMemcpyAsync(result.filtered.data(),processed,count_out*sizeof(double),cudaMemcpyDeviceToHost,stream));
+   if (has_air) {
+      air_apply_cuda(processed,air_output.get(),channels,samples_out,fs_out,*air,properties,stream);
+      processed=air_output.get();
+   }
+   post_cuda_check(cudaMemcpyAsync(result.filtered.data(),processed,final_count*sizeof(double),cudaMemcpyDeviceToHost,stream));
    post_cuda_check(cudaStreamSynchronize(stream));
    check_post_finite(result.raw); check_post_finite(result.filtered);
    return result;
