@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 #include <fdtd_data.h>
@@ -24,7 +25,7 @@ struct SchedulerFixture {
       return (x*data.Ny+y)*data.Nz+z;
    }
 
-   SchedulerFixture(bool fcc, bool with_ade, int64_t steps) : data{} {
+   SchedulerFixture(bool fcc, int boundary_case, int64_t steps) : data{} {
       data.Nx=10; data.Ny=8; data.Nz=10;
       data.Npts=data.Nx*data.Ny*data.Nz;
       data.Nt=steps; data.fcc_flag=fcc ? 2 : 0; data.NN=fcc ? 12 : 6;
@@ -36,18 +37,20 @@ struct SchedulerFixture {
       data.a2=(Real)(factor*data.l2);
       data.sl2=(Real)scaled;
       data.lo2=(Real)(0.5*data.l);
-      data.Nm=1;
-      poles.push_back(11);
-      beta.push_back((Real)0.125);
-      quads.resize(MMb);
-      for (int m=0; m<MMb; ++m) {
-         quads[m].b=(Real)((m+1)*0.0009765625);
-         quads[m].bd=(Real)0.5;
-         quads[m].bDh=(Real)((m+1)*0.001953125);
-         quads[m].bFh=(Real)0.0009765625;
-      }
+      data.Nm=MMb+1;
+      for (int k=0; k<data.Nm; ++k) poles.push_back((int8_t)k);
+      beta.assign(data.Nm,(Real)0.125);
+      quads.resize(data.Nm*MMb);
+      for (int k=0; k<data.Nm; ++k)
+         for (int m=0; m<MMb; ++m) {
+            MatQuad &quad=quads[k*MMb+m];
+            quad.b=(Real)((m+1)*0.0009765625);
+            quad.bd=(Real)0.5;
+            quad.bDh=(Real)((m+1)*(k%3+1)*0.001953125);
+            quad.bFh=(Real)0.0009765625;
+         }
       mask.assign((data.Npts+7)/8,0);
-      if (with_ade) {
+      if (boundary_case != 0) {
          const int cart[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
          const int fcc_links[12][3]={{1,1,0},{-1,-1,0},{0,1,1},{0,-1,-1},
                {1,0,1},{-1,0,-1},{1,-1,0},{-1,1,0},{0,1,-1},{0,-1,1},
@@ -72,9 +75,12 @@ struct SchedulerFixture {
                      neighbours.push_back((int8_t)__builtin_popcount((unsigned)adj));
                   }
                }
-         lossy=boundary;
-         surface.assign(boundary.size(),(Real)0.75);
-         material.assign(boundary.size(),0);
+         for (size_t i=0; i<boundary.size(); ++i)
+            if (boundary_case==1 || i%3!=0) {
+               lossy.push_back(boundary[i]);
+               surface.push_back((Real)0.75);
+               material.push_back((int8_t)(i%data.Nm));
+            }
          for (int64_t i : boundary) mask[i>>3] |= (uint8_t)(1u<<(i%8));
       }
       data.Nb=boundary.size(); data.Nbl=lossy.size();
@@ -88,7 +94,7 @@ struct SchedulerFixture {
             }
       data.Nba=abc.size();
       sources={index(3,3,3),index(6,3,4)};
-      receivers={sources[0],sources[0],sources[1],index(7,4,5)};
+      receivers={sources[0],sources[0],sources[1],index(4,3,3),index(5,3,3),index(7,4,5)};
       data.Ns=sources.size(); data.Nr=receivers.size();
       input.resize(data.Ns*steps);
       for (int64_t n=0; n<steps; ++n) {
@@ -114,25 +120,39 @@ struct SchedulerFixture {
    }
 };
 
-static void compare_case(bool fcc, bool ade, int64_t steps) {
-   SchedulerFixture fixture(fcc,ade,steps);
+struct SavedEnvironment {
+   const char *name;
+   bool present;
+   std::string value;
+   explicit SavedEnvironment(const char *key) : name(key), present(getenv(key)!=nullptr),
+         value(present ? getenv(key) : "") {}
+   ~SavedEnvironment() {
+      if (present) setenv(name,value.c_str(),1);
+      else unsetenv(name);
+   }
+};
+
+struct SolverMode { const char *name, *async, *graphs, *boundary, *ade; };
+
+static int compare_case(bool fcc, int boundary_case, int64_t steps) {
+   SchedulerFixture fixture(fcc,boundary_case,steps);
    if (!pffdtd::scheduler_receivers_interior(fixture.data.out_ixyz,fixture.data.Nr,
           fixture.data.Nx,fixture.data.Ny,fixture.data.Nz)) {
       std::fprintf(stderr,"FAIL: fixture receivers would bypass the async scheduler\n");
       std::exit(EXIT_FAILURE);
    }
    setenv("PFFDTD_ASYNC","0",1);
+   setenv("PFFDTD_GRAPHS","0",1);
+   setenv("PFFDTD_BOUNDARY_FUSED","0",1);
+   setenv("PFFDTD_ADE_MODE","generic",1);
+   std::fill(fixture.output.begin(),fixture.output.end(),std::numeric_limits<double>::quiet_NaN());
    run_sim(&fixture.data);
    const std::vector<double> expected=fixture.output;
-   std::fill(fixture.output.begin(),fixture.output.end(),0.0);
-   setenv("PFFDTD_ASYNC","1",1);
-   run_sim(&fixture.data);
    bool nonzero=false;
    for (size_t i=0; i<expected.size(); ++i) {
-      if (!std::isfinite(expected[i]) || !std::isfinite(fixture.output[i]) ||
-          std::memcmp(&expected[i],&fixture.output[i],sizeof(double)) != 0) {
-         std::fprintf(stderr,"FAIL scheduler FP%d FCC=%d ADE=%d Nt=%lld sample=%zu\n",
-                      (int)(8*sizeof(Real)),fcc,ade,(long long)steps,i);
+      if (!std::isfinite(expected[i])) {
+         std::fprintf(stderr,"FAIL reference FP%d FCC=%d boundary=%d Nt=%lld sample=%zu\n",
+                      (int)(8*sizeof(Real)),fcc,boundary_case,(long long)steps,i);
          std::exit(EXIT_FAILURE);
       }
       nonzero |= expected[i] != 0.0;
@@ -141,6 +161,37 @@ static void compare_case(bool fcc, bool ade, int64_t steps) {
       std::fprintf(stderr,"FAIL: full-engine fixture produced only zeros\n");
       std::exit(EXIT_FAILURE);
    }
+   const SolverMode modes[]={
+      {"events","1","0","0","generic"}, {"graphs","0","1","0","generic"},
+      {"fused-sync","0","0","1","generic"}, {"fused-events","1","0","1","generic"},
+      {"fused-graphs","0","1","1","generic"},
+      {"reload-sync","0","0","1","reload"}, {"reload-events","1","0","1","reload"},
+      {"reload-graphs","0","1","1","reload"},
+      {"fixed-sync","0","0","1","fixed"}, {"fixed-events","1","0","1","fixed"},
+      {"fixed-graphs","0","1","1","fixed"}
+   };
+   int comparisons=0;
+   for (const SolverMode &mode : modes) {
+#ifdef BOUNDARY_SEPARATE
+      if (strcmp(mode.boundary,"1")==0) continue;
+#endif
+      std::fill(fixture.output.begin(),fixture.output.end(),std::numeric_limits<double>::quiet_NaN());
+      setenv("PFFDTD_ASYNC",mode.async,1);
+      setenv("PFFDTD_GRAPHS",mode.graphs,1);
+      setenv("PFFDTD_BOUNDARY_FUSED",mode.boundary,1);
+      setenv("PFFDTD_ADE_MODE",mode.ade,1);
+      run_sim(&fixture.data);
+      for (size_t i=0; i<expected.size(); ++i)
+         if (!std::isfinite(fixture.output[i]) ||
+             std::memcmp(&expected[i],&fixture.output[i],sizeof(double)) != 0) {
+            std::fprintf(stderr,"FAIL %s FP%d FCC=%d boundary=%d Nt=%lld sample=%zu\n",
+                         mode.name,(int)(8*sizeof(Real)),fcc,boundary_case,
+                         (long long)steps,i);
+            std::exit(EXIT_FAILURE);
+         }
+      ++comparisons;
+   }
+   return comparisons;
 }
 
 int main() {
@@ -158,23 +209,18 @@ int main() {
       std::fprintf(stderr,"Select exactly one GPU with CUDA_VISIBLE_DEVICES\n");
       return EXIT_FAILURE;
    }
-   const char *old_async=getenv("PFFDTD_ASYNC");
-   const bool had_async=old_async != nullptr;
-   const std::string previous_async=had_async ? old_async : "";
-   const char *old_progress=getenv("PFFDTD_PROGRESS");
-   const bool had_progress=old_progress != nullptr;
-   const std::string previous_progress=had_progress ? old_progress : "";
+   SavedEnvironment saved_async("PFFDTD_ASYNC"), saved_graphs("PFFDTD_GRAPHS"),
+      saved_boundary("PFFDTD_BOUNDARY_FUSED"), saved_ade("PFFDTD_ADE_MODE"), saved_progress("PFFDTD_PROGRESS");
    setenv("PFFDTD_PROGRESS","0",1);
-   const int64_t lengths[]={1,2,3,5,6,7,511,512,513,1025};
-   int cases=0;
+   const int64_t lengths[]={1,2,3,5,6,7,95,96,97,511,512,513,1025,1536,1537,3073};
+   int cases=0,comparisons=0;
    for (bool fcc : {false,true})
-      for (bool ade : {false,true})
-         for (int64_t steps : lengths) { compare_case(fcc,ade,steps); ++cases; }
-   if (had_async) setenv("PFFDTD_ASYNC",previous_async.c_str(),1);
-   else unsetenv("PFFDTD_ASYNC");
-   if (had_progress) setenv("PFFDTD_PROGRESS",previous_progress.c_str(),1);
-   else unsetenv("PFFDTD_PROGRESS");
-   std::printf("scheduler_cuda_check: PASS FP%d, %d full-engine cases, exact outputs\n",
-               (int)(8*sizeof(Real)),cases);
+      for (int boundary_case : {0,1,2})
+         for (int64_t steps : lengths) {
+            comparisons+=compare_case(fcc,boundary_case,steps);
+            ++cases;
+         }
+   std::printf("scheduler_cuda_check: PASS FP%d, %d full-engine cases, %d exact comparisons\n",
+               (int)(8*sizeof(Real)),cases,comparisons);
    return EXIT_SUCCESS;
 }

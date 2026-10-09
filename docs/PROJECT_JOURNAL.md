@@ -249,3 +249,51 @@ richiede ancora host aarch64 e librerie corrispondenti.
 **Aperto:** gate CUDA/Compute Sanitizer e benchmark separati Ada/GB10;
 poi Graphs e specializzazione ADE con confronto misurato, oltre alla pipeline
 prepare/postprocess nativa.
+
+---
+
+## 2026-10-09 — CUDA Graphs, stencil/ADE fusi e harness nativo
+**Contesto:** lo scheduler a eventi elimina le attese host per passo ma lascia
+i lanci individuali; rigid+FDGrid conserva una pressione intermedia globale.
+**Modifiche:** `PFFDTD_GRAPHS=1` cattura pacchetti da 96/6 passi sul launcher
+comune, con cache per fase n%6, contatore device sorgenti/readout e code dirette
+prima dei drain a 512 campioni. Setup/cattura resta incluso nel wall time.
+`PFFDTD_BOUNDARY_FUSED=1` unisce stencil e ADE con mappa boundary/lossy
+validata int32/int64; tre carry e ordine aritmetico conservati. I riferimenti
+sync, eventi e `BOUNDARY_SEPARATE` rimangono selezionabili.
+Harness `fdtd_bench.cu` con HDF5 esistenti, confronti esatti, interleaving,
+CSV/metadati e wall time completo di run_sim; nessun calcolo Python.
+**Razionale:** grafi ripetibili eliminano lanci host individuali del pacchetto;
+fusione completa evita store/load di pressione e indice lossy, al costo della
+mappa per ogni boundary e della pressione sui registri. Nessuno speedup dedotto
+dai soli conteggi o dalla compilazione.
+**Esito:** PASS planner Graphs su 1440 modelli randomizzati e sanitizer;
+PASS mappa su 4101 casi strict/sanitizer; PASS stencil/ADE FP32/64, 2820x37
+per precisione anche ASan/UBSan. Fixture CUDA completa ampliata a 96 casi
+per precisione; unit device boundary a 348x37, con stato/padding seeded.
+PASS build CUDA/fixture Ada e GB10; esecuzione device SKIP77 senza GPU.
+ptxas fuso generico: Ada 40/44 registri FP32/64; GB10 Cart/FCC FP32 48/64,
+FP64 64; stack 96/192 B e zero spill dichiarati. Non è misura del traffico.
+**Aperto:** bit equality/stabilità/RIR/Compute Sanitizer e benchmark Ada/GB10;
+array ADE locali, pipeline prepare/postprocess nativa e temporal blocking.
+
+---
+
+## 2026-10-09 — ADE scalar reload e dispatch a poli fissi
+**Contesto:** il report ptxas conferma array ADE locali: stack 96/192 B per
+thread, pur senza spill dichiarati. Il solo conteggio spill non bastava.
+**Modifiche:** con boundary fusa `PFFDTD_ADE_MODE=reload` usa due passaggi
+scalari, senza aggiornare stati nel primo. `fixed` srotola i poli0/1/11/12
+e usa reload negli altri casi; `generic` resta il default. Il benchmark
+interleaved confronta dodici combinazioni con CSV, metadati e verifica esatta.
+**Razionale:** reload rimuove gli array locali e rilegge gli stati globali;
+fixed evita quelle riletture nei casi comuni ma aumenta la pressione sui registri.
+**Esito:** PASS 56 casi ADE x37 per precisione contro CPU indipendente,
+incluse rotazioni/padding/zero area/stati nulli con zero poli; PASS sanitizer.
+I test stencil2820x37 e CUDA348x37 includono tutti e tre i modi e poli0..12.
+ptxas integrato, map32/64: Ada reload39/44 registri FP32/64, fixed96/166;
+GB10 reload48 FP32 e48Cart/56FCC FP64, fixed80/166. Stack/spill zero per
+reload/fixed nelle48 istanze dei quattro build, rispetto a96/192 B generic.
+Build CUDA/fixture/benchmark PASS; device SKIP77, nessuna misura di velocità.
+**Aperto:** scegliere per GPU e densità solo dopo gate numerici e benchmark;
+stabilità lunga/RIR, budget memoria, temporal blocking e pipeline nativa.

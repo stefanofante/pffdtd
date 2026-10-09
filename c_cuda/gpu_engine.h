@@ -44,6 +44,8 @@
 #endif
 #include <halo_faces.h>
 #include <scheduler_plan.h>
+#include <graph_plan.h>
+#include <boundary_map.h>
 
 #define CU_DIV_CEIL(x,y) ((DIV_CEIL(x,y)==0)? (1) : (DIV_CEIL(x,y))) //want 0 to map to 1, otherwise kernel errors
 
@@ -154,6 +156,10 @@ struct gpuHostData { //arrays on host (for copy), mirrors gpu local data
 
 //these are arrays pointing to GPU device memory, or CUDA stuff (dim3, events)
 struct gpuData { //for or on gpu (arrays all on GPU)
+   void *boundary_lossy_map;
+   bool fused_boundary;
+   bool boundary_map32;
+   int ade_mode;
    int64_t *bn_ixyz;
    int64_t *bnl_ixyz;
    int64_t *bna_ixyz;
@@ -404,6 +410,24 @@ __global__ void KernelBoundaryABC(Real * __restrict__ u0,
 
 //Part of freq-dep boundary update
 #include <boundary_fd.h>
+#include <boundary_stencil.h>
+
+template<bool FCC, typename MapIdx, int ADEMode = 0>
+__global__ void KernelBoundaryStencil(
+      Real * __restrict__ u0, const Real * __restrict__ u1,
+      Real * __restrict__ u0b, const Real * __restrict__ u2b,
+      Real * __restrict__ vh1, Real * __restrict__ gh1,
+      const int64_t * __restrict__ bn_ixyz, const uint16_t * __restrict__ adj_bn,
+      const int8_t * __restrict__ K_bn, const MapIdx * __restrict__ lossy_map,
+      const Real *ssaf_bnl, const int8_t *mat_bnl,
+      const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads)
+{
+   const int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   if (nb<cuNb)
+      boundary_stencil_node<FCC,MapIdx,ADEMode>(u0,u1,u0b,u2b,vh1,gh1,bn_ixyz,adj_bn,K_bn,
+         lossy_map,ssaf_bnl,mat_bnl,mat_beta,mat_quads,cuMb,csl2,c2,clo2,
+         cuNx,cuNxNy,cuNbl,nb);
+}
 
 // Gather, ADE correction and scatter in one launch; the rigid stencil stays ordered before it.
 __global__ void KernelBoundaryFDGrid(Real * __restrict__ u0, Real * __restrict__ u0b,
@@ -480,6 +504,29 @@ __global__ void AddInBatch(Real * __restrict__ u0, const int64_t * __restrict__ 
 {
    int64_t i = blockIdx.x*cuBrw + threadIdx.x;
    if (i<Ns) u0[in_ixyz[i]] += (Real)(-in_sigs[i*Nt+n]);
+}
+
+// Graph replay keeps kernel parameters fixed; only the device timestep advances.
+__global__ void AddInBatchGraph(Real * __restrict__ u0, const int64_t * __restrict__ in_ixyz,
+                              const double * __restrict__ in_sigs, int64_t Ns, int64_t Nt,
+                              const int64_t *step_base, int64_t offset)
+{
+   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t n = *step_base + offset;
+   if (i<Ns) u0[in_ixyz[i]] += (Real)(-in_sigs[i*Nt+n]);
+}
+
+__global__ void ReadoutGraph(Real *buffer, const Real *u, const int64_t *locs, int64_t N,
+                            const int64_t *step_base, int64_t offset, int64_t readout_block)
+{
+   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t col = (*step_base + offset) % readout_block;
+   if (i<N) buffer[col*N+i] = u[locs[i]];
+}
+
+__global__ void AdvanceGraphStep(int64_t *step_base, int64_t steps)
+{
+   if (blockIdx.x == 0 && threadIdx.x == 0) *step_base += steps;
 }
 
 //dst-src copy from buffer to grid
@@ -743,6 +790,240 @@ void split_data(const struct SimData *sd, struct gpuHostData *ghds, int ngpus) {
    assert(Nr_check==Nr);
 }
 
+template<typename MapIdx>
+static void prepare_boundary_map(struct gpuData *gd, const struct gpuHostData *ghd)
+{
+   if (ghd->Nb==0) {
+      if (ghd->Nbl!=0) {
+         fprintf(stderr,"PFFDTD_BOUNDARY_FUSED: lossy nodes require boundary nodes.\n");
+         exit(EXIT_FAILURE);
+      }
+      return;
+   }
+   if (ghd->Nb<0 || (uint64_t)ghd->Nb>SIZE_MAX/sizeof(MapIdx)) {
+      fprintf(stderr,"Boundary map byte count exceeds host address space.\n");
+      exit(EXIT_FAILURE);
+   }
+   const size_t bytes = (size_t)ghd->Nb*sizeof(MapIdx);
+   MapIdx *map = (MapIdx *)malloc(bytes);
+   if (!map) {
+      fprintf(stderr,"Cannot allocate %zu host bytes for the boundary map.\n",bytes);
+      exit(EXIT_FAILURE);
+   }
+   const pffdtd::BoundaryMapStatus status = pffdtd::build_boundary_lossy_map(
+      ghd->bn_ixyz,ghd->Nb,ghd->bnl_ixyz,ghd->Nbl,ghd->Npts,map);
+   if (status!=pffdtd::BoundaryMapStatus::Success) {
+      free(map);
+      fprintf(stderr,"PFFDTD_BOUNDARY_FUSED: %s.\n",pffdtd::boundary_map_status_string(status));
+      exit(EXIT_FAILURE);
+   }
+   gpuErrchk( cudaMalloc(&gd->boundary_lossy_map,bytes) );
+   gpuErrchk( cudaMemcpy(gd->boundary_lossy_map,map,bytes,cudaMemcpyHostToDevice) );
+   free(map);
+}
+
+template<bool FCC, typename MapIdx, int ADEMode>
+static void launch_boundary_stencil_mode(struct gpuData *gd, cudaStream_t stream)
+{
+   KernelBoundaryStencil<FCC,MapIdx,ADEMode><<<gd->grid_dim_bn,gd->block_dim_bn,0,stream>>>(
+      gd->u0,gd->u1,gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->bn_ixyz,gd->adj_bn,gd->K_bn,
+      (const MapIdx *)gd->boundary_lossy_map,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
+}
+
+template<bool FCC, typename MapIdx>
+static void launch_boundary_stencil(struct gpuData *gd, cudaStream_t stream)
+{
+   if (gd->ade_mode==1) launch_boundary_stencil_mode<FCC,MapIdx,1>(gd,stream);
+   else if (gd->ade_mode==2) launch_boundary_stencil_mode<FCC,MapIdx,2>(gd,stream);
+   else launch_boundary_stencil_mode<FCC,MapIdx,0>(gd,stream);
+}
+
+// One physics launch path for synchronous, event-chained and captured timesteps.
+// A graph uses one stream: readout follows air, while reading the same interior u1 cells.
+static void launch_gpu_step(const struct SimData *sd, struct gpuData *gd,
+                            const struct gpuHostData *ghd, int gid, int ngpus, int64_t n,
+                            bool async_single_gpu, bool serial_graph, int readout_block,
+                            const int64_t *step_base = NULL, int64_t offset = 0)
+{
+   cudaStream_t air_stream = gd->cuStream_air;
+   cudaStream_t bn_stream = serial_graph ? air_stream : gd->cuStream_bn;
+   // A wait captures the previous event record before air_end is reused below.
+   // The same stream also orders readout(n-1) before boundary(n).
+   if (async_single_gpu && !serial_graph && n>0)
+      gpuErrchk( cudaStreamWaitEvent(bn_stream,gd->cuEv_air_end,0) );
+   //boundary updates (using intermediate buffer)
+   if (!async_single_gpu && !serial_graph)
+      gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_start,bn_stream) );
+
+   //boundary updates
+   if (sd->fcc_flag!=0) {
+      //B7: fold shares the air index space -> same int32/int64 guard
+      if (ghd->Npts < INT32_MAX) {
+         KernelFoldFCC<int32_t><<<gd->grid_dim_fold,gd->block_dim_fold,0,bn_stream>>>(gd->u1);
+      }
+      else {
+         KernelFoldFCC<int64_t><<<gd->grid_dim_fold,gd->block_dim_fold,0,bn_stream>>>(gd->u1);
+      }
+   }
+   if (gd->fused_boundary) {
+      if (sd->fcc_flag==0) {
+         if (gd->boundary_map32) launch_boundary_stencil<false,int32_t>(gd,bn_stream);
+         else launch_boundary_stencil<false,int64_t>(gd,bn_stream);
+      }
+      else {
+         if (gd->boundary_map32) launch_boundary_stencil<true,int32_t>(gd,bn_stream);
+         else launch_boundary_stencil<true,int64_t>(gd,bn_stream);
+      }
+   }
+   else {
+   if (sd->fcc_flag==0)
+      KernelBoundaryRigidCart<<<gd->grid_dim_bn,gd->block_dim_bn,0,bn_stream>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
+   else
+      KernelBoundaryRigidFCC<<<gd->grid_dim_bn,gd->block_dim_bn,0,bn_stream>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
+   // Keep the three-slot pressure carry; only the gather/scatter intermediates are fused.
+#ifdef BOUNDARY_SEPARATE
+   CopyFromGridKernel<<<gd->grid_dim_bnl,gd->block_dim_bn,0,bn_stream>>>(gd->u0b, gd->u0, gd->bnl_ixyz, ghd->Nbl);
+   //possible this could be moved to host
+   KernelBoundaryFD<<<gd->grid_dim_bnl,gd->block_dim_bn,0,bn_stream>>>(gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
+   //copy to back to grid
+   CopyToGridKernel<<<gd->grid_dim_bnl,gd->block_dim_bn,0,bn_stream>>>(gd->u0, gd->u0b, gd->bnl_ixyz, ghd->Nbl);
+#else
+   KernelBoundaryFDGrid<<<gd->grid_dim_bnl,gd->block_dim_bn,0,bn_stream>>>(gd->u0,gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->bnl_ixyz,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
+#endif
+   }
+   if (!serial_graph)
+      gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_end,bn_stream) );
+
+   //air updates (including source
+   if (!serial_graph)
+      gpuErrchk( cudaStreamWaitEvent(air_stream,gd->cuEv_bn_roundtrip_end,0) ); //might as well wait
+   //run air kernel (with mask)
+   if (!async_single_gpu && !serial_graph)
+      gpuErrchk( cudaEventRecord(gd->cuEv_air_start,air_stream) );
+
+   //for absorbing boundaries at boundaries of grid
+   CopyFromGridKernel<<<gd->grid_dim_bna,gd->block_dim_bn,0,air_stream>>>(gd->u2ba, gd->u0, gd->bna_ixyz, ghd->Nba);
+#ifdef HALO_SEPARATE
+   const bool separate_halos = true; //B11 A/B reference
+#else
+   const bool separate_halos = !pffdtd::halo_faces_fusable(sd->Nz,sd->Ny);
+#endif
+   if (separate_halos) {
+   //Ordered faces also handle three-cell axes whose mirrors touch opposite halos.
+   if (gid==0) {
+      FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,air_stream>>>(gd->u1);
+   }
+   if (gid==ngpus-1) {
+      FlipHaloXY_Zend<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,air_stream>>>(gd->u1);
+   }
+   FlipHaloXZ_Ybeg<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,air_stream>>>(gd->u1);
+   if (sd->fcc_flag==0) {
+      FlipHaloXZ_Yend<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,air_stream>>>(gd->u1);
+   }
+   FlipHaloYZ_Xbeg<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,air_stream>>>(gd->u1);
+   FlipHaloYZ_Xend<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,air_stream>>>(gd->u1);
+   }
+   else {
+   //B11: conditional faces separate (different guards), 3 always-present faces fused.
+   //For axes >=4, XZ_Yend has no dependency on XZ_Ybeg, so it can precede
+   //the fused launch. XY faces are always completed first on this stream.
+   if (gid==0) {
+      FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,air_stream>>>(gd->u1);
+   }
+   if (gid==ngpus-1) {
+      FlipHaloXY_Zend<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,air_stream>>>(gd->u1);
+   }
+   if (sd->fcc_flag==0) {
+      FlipHaloXZ_Yend<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,air_stream>>>(gd->u1);
+   }
+   {
+      int64_t amax = (sd->Nz > sd->Ny) ? sd->Nz : sd->Ny;  //a-axis covers max(Nx_kernel=Nz, Ny)
+      dim3 bdh(cuBx2, cuBy2, 1);
+      dim3 gdh(CU_DIV_CEIL(amax,cuBx2), CU_DIV_CEIL(ghd->Nxh,cuBy2), 3);
+      if (ghd->Npts < INT32_MAX) {
+         FlipHaloFaces<int32_t><<<gdh,bdh,0,air_stream>>>(gd->u1);
+      }
+      else {
+         FlipHaloFaces<int64_t><<<gdh,bdh,0,air_stream>>>(gd->u1);
+      }
+   }
+   }
+
+   //injecting source first, negation done inside kernel (NB source on different stream than bn)
+   if (ghd->Ns>0) {
+      if (step_base)
+         AddInBatchGraph<<<CU_DIV_CEIL(ghd->Ns,cuBrw),cuBrw,0,air_stream>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,step_base,offset);
+      else
+         AddInBatch<<<CU_DIV_CEIL(ghd->Ns,cuBrw),cuBrw,0,air_stream>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,n);
+   }
+   //now air updates (not conflicting with bn updates because of bn_mask)
+   if (sd->fcc_flag==0) {
+      //B7: 32-bit index path when per-GPU grid fits (Npts<INT32_MAX), else int64 fallback
+      if (ghd->Npts < INT32_MAX) {
+         KernelAirCart<int32_t><<<gd->grid_dim_air,gd->block_dim_air,0,air_stream>>>(gd->u0,gd->u1,gd->bn_mask);
+      }
+      else {
+         KernelAirCart<int64_t><<<gd->grid_dim_air,gd->block_dim_air,0,air_stream>>>(gd->u0,gd->u1,gd->bn_mask);
+      }
+   }
+   else {
+      //B7: 32-bit index path when per-GPU grid fits (Npts<INT32_MAX), else int64 fallback
+      if (ghd->Npts < INT32_MAX) {
+         KernelAirFCC<int32_t><<<gd->grid_dim_air,gd->block_dim_air,0,air_stream>>>(gd->u0,gd->u1,gd->bn_mask);
+      }
+      else {
+         KernelAirFCC<int64_t><<<gd->grid_dim_air,gd->block_dim_air,0,air_stream>>>(gd->u0,gd->u1,gd->bn_mask);
+      }
+   }
+   //boundary ABC loss
+   KernelBoundaryABC<<<gd->grid_dim_bna,gd->block_dim_bn,0,air_stream>>>(gd->u0,gd->u2ba,gd->Q_bna,gd->bna_ixyz);
+   if (!serial_graph)
+      gpuErrchk( cudaEventRecord(gd->cuEv_air_end,air_stream) ); //dependency, plus reference timing
+
+   //readouts (write into block column col; drain D2H in batches of READOUT_BLOCK steps)
+   int64_t col = n % readout_block;
+   if (step_base)
+      ReadoutGraph<<<gd->grid_dim_readout,gd->block_dim_readout,0,bn_stream>>>(gd->u_out_buf,gd->u1,gd->out_ixyz,ghd->Nr,step_base,offset,readout_block);
+   else
+      CopyFromGridKernel<<<gd->grid_dim_readout,gd->block_dim_readout,0,bn_stream>>>(gd->u_out_buf + col*ghd->Nr, gd->u1, gd->out_ixyz, ghd->Nr);
+   if (!async_single_gpu && !serial_graph)
+      gpuErrchk( cudaEventRecord(gd->cuEv_readout_end,bn_stream) );
+}
+
+static void rotate_gpu_pointers(struct gpuData *gd)
+{
+   Real *tmp = gd->u1;
+   gd->u1 = gd->u0;
+   gd->u0 = tmp;
+   tmp = gd->u2b;
+   gd->u2b = gd->u1b;
+   gd->u1b = gd->u0b;
+   gd->u0b = tmp;
+}
+
+static cudaGraphExec_t capture_gpu_steps(const struct SimData *sd, struct gpuData *gd,
+                                         const struct gpuHostData *ghd, int64_t steps,
+                                         int readout_block, int64_t *step_base)
+{
+   assert(steps>0 && steps%6==0);
+   struct gpuData view = *gd; // Rotate a host-only view; captured pointers repeat after six steps.
+   cudaGraph_t graph;
+   cudaGraphExec_t executable;
+   gpuErrchk( cudaStreamBeginCapture(gd->cuStream_air,cudaStreamCaptureModeThreadLocal) );
+   for (int64_t offset=0; offset<steps; offset++) {
+      launch_gpu_step(sd,&view,ghd,0,1,0,true,true,readout_block,step_base,offset);
+      rotate_gpu_pointers(&view);
+   }
+   // FIFO joins all physics and readout before advancing the version read by the next replay.
+   AdvanceGraphStep<<<1,1,0,gd->cuStream_air>>>(step_base,steps);
+   gpuErrchk( cudaStreamEndCapture(gd->cuStream_air,&graph) );
+   assert(view.u0==gd->u0 && view.u1==gd->u1 && view.u0b==gd->u0b &&
+          view.u1b==gd->u1b && view.u2b==gd->u2b);
+   gpuErrchk( cudaGraphInstantiate(&executable,graph,0) );
+   gpuErrchk( cudaGraphDestroy(graph) );
+   return executable;
+}
+
 //run the sim!
 double run_sim(const struct SimData *sd) 
 {
@@ -765,15 +1046,38 @@ double run_sim(const struct SimData *sd)
       exit(EXIT_FAILURE);
    }
    ngpus = max_ngpus; 
-   bool async_single_gpu = pffdtd::scheduler_async_requested(ngpus,getenv("PFFDTD_ASYNC"));
+   bool graphs_single_gpu = pffdtd::scheduler_async_requested(ngpus,getenv("PFFDTD_GRAPHS"));
+   bool async_single_gpu = graphs_single_gpu || pffdtd::scheduler_async_requested(ngpus,getenv("PFFDTD_ASYNC"));
    if (async_single_gpu && !pffdtd::scheduler_receivers_interior(
          sd->out_ixyz,sd->Nr,sd->Nx,sd->Ny,sd->Nz)) {
-      fprintf(stderr,"PFFDTD_ASYNC: halo or invalid receiver indices require the synchronous scheduler.\n");
+      fprintf(stderr,"PFFDTD_ASYNC/PFFDTD_GRAPHS: halo or invalid receiver indices require the synchronous scheduler.\n");
       async_single_gpu = false;
+      graphs_single_gpu = false;
    }
-   printf("Scheduler: %s\n",async_single_gpu ? "single-GPU event chain (PFFDTD_ASYNC=1)" : "synchronous reference");
+   printf("Scheduler: %s\n",graphs_single_gpu ? "single-GPU CUDA Graphs (PFFDTD_GRAPHS=1)" :
+          async_single_gpu ? "single-GPU event chain (PFFDTD_ASYNC=1)" : "synchronous reference");
    const char *progress_mode = getenv("PFFDTD_PROGRESS");
    const bool progress_enabled = !(progress_mode && strcmp(progress_mode,"0") == 0);
+   const char *boundary_mode = getenv("PFFDTD_BOUNDARY_FUSED");
+#ifdef BOUNDARY_SEPARATE
+   const bool fused_boundary_requested = false;
+   (void)boundary_mode;
+#else
+   const bool fused_boundary_requested = boundary_mode && strcmp(boundary_mode,"1")==0;
+#endif
+   printf("Boundary: %s\n",fused_boundary_requested ? "rigid stencil + ADE fused" : "ordered reference");
+   const char *ade_mode = getenv("PFFDTD_ADE_MODE");
+   int selected_ade_mode = 0;
+   if (fused_boundary_requested && ade_mode) {
+      if (strcmp(ade_mode,"reload")==0) selected_ade_mode=1;
+      else if (strcmp(ade_mode,"fixed")==0) selected_ade_mode=2;
+      else if (strcmp(ade_mode,"generic")!=0 && ade_mode[0]!='\0') {
+         fprintf(stderr,"PFFDTD_ADE_MODE must be generic, reload or fixed.\n");
+         exit(EXIT_FAILURE);
+      }
+   }
+   printf("ADE: %s\n",selected_ade_mode==1 ? "scalar two-pass reload" :
+          selected_ade_mode==2 ? "fixed-pole dispatch + scalar fallback" : "generic reference");
    assert(ngpus < (sd->Nx));
    struct gpuData *gds;
    mymalloc((void **)&gds, ngpus*sizeof(gpuData)); 
@@ -935,6 +1239,14 @@ double run_sim(const struct SimData *sd)
          assert(jj>=0);
          assert(jj < ghd->Npts);
          ghd->out_ixyz[nr] = jj;
+      }
+
+      gd->fused_boundary = fused_boundary_requested;
+      gd->ade_mode = selected_ade_mode;
+      gd->boundary_map32 = ghd->Nbl<=INT32_MAX;
+      if (gd->fused_boundary) {
+         if (gd->boundary_map32) prepare_boundary_map<int32_t>(gd,ghd);
+         else prepare_boundary_map<int64_t>(gd,ghd);
       }
 
       gpuErrchk( cudaMalloc(&(gd->u0), (size_t)((ghd->Npts)*sizeof(Real))) );
@@ -1121,11 +1433,48 @@ double run_sim(const struct SimData *sd)
       assert(use32 || sizeof(int64_t)==8); //int64 fallback always valid; guard documents intent
    }
 
+   // Cache by graph length and n%6: two scalar tails at a full drain change the phase.
+   cudaGraphExec_t graph_exec[2][6] = {{0}};
+   int64_t *graph_step_base = NULL;
+   double graph_setup_seconds = 0.0;
+   int graph_cache_entries = 0;
+   int64_t graph_replays = 0, graph_scalar_steps = 0;
+   if (graphs_single_gpu) {
+      gpuErrchk( cudaMalloc(&graph_step_base,sizeof(int64_t)) );
+      gpuErrchk( cudaMemset(graph_step_base,0,sizeof(int64_t)) );
+   }
    // Nonblocking streams do not inherit setup work queued on the legacy default stream.
    if (async_single_gpu) gpuErrchk( cudaDeviceSynchronize() );
    const double async_wall_start = async_single_gpu ? omp_get_wtime() : 0.0;
    for (int64_t n=0; n<sd->Nt; n++) { //loop over time-steps
+      if (graphs_single_gpu) {
+         struct gpuData *gd = &gds[0];
+         const pffdtd::GraphChunkPlan chunk = pffdtd::graph_chunk_plan(n,sd->Nt,READOUT_BLOCK,96);
+         assert(chunk.steps>0);
+         if (chunk.reusable) {
+            const int kind = chunk.steps==96 ? 1 : 0;
+            cudaGraphExec_t *executable = &graph_exec[kind][chunk.phase];
+            if (*executable == NULL) {
+               const double setup_start = omp_get_wtime();
+               *executable = capture_gpu_steps(sd,gd,&ghds[0],chunk.steps,READOUT_BLOCK,graph_step_base);
+               graph_setup_seconds += omp_get_wtime() - setup_start;
+               graph_cache_entries++;
+            }
+            gpuErrchk( cudaGraphLaunch(*executable,gd->cuStream_air) );
+            graph_replays++;
+            // A complete graph's fixed-address rotation is the identity.
+         }
+         else {
+            launch_gpu_step(sd,gd,&ghds[0],0,1,n,true,true,READOUT_BLOCK);
+            // The scalar tail uses n directly, then commits the device counter on the same stream.
+            AdvanceGraphStep<<<1,1,0,gd->cuStream_air>>>(graph_step_base,1);
+            rotate_gpu_pointers(gd);
+            graph_scalar_steps++;
+         }
+         n += chunk.steps - 1; // The shared drain/telemetry observes the last step of this packet.
+      }
       const pffdtd::SchedulePlan plan = pffdtd::schedule_plan(n,sd->Nt,READOUT_BLOCK);
+      if (!graphs_single_gpu) {
       for (int gid=0; gid < ngpus; gid++) { //loop over GPUs (one thread launches all kernels)
          gpuErrchk( cudaSetDevice(gid) );
          struct gpuData *gd = &(gds[gid]); //get struct of device pointers
@@ -1136,126 +1485,8 @@ double run_sim(const struct SimData *sd)
             if (n==0) gpuErrchk( cudaEventRecord(cuEv_main_start,0) ); //not sure if to put on stream, check slides again
             gpuErrchk( cudaEventRecord(cuEv_main_sample_start,0) );
          }
-         // A wait captures the previous event record before air_end is reused below.
-         // The same stream also orders readout(n-1) before boundary(n).
-         if (async_single_gpu && plan.wait_previous_air)
-            gpuErrchk( cudaStreamWaitEvent(gd->cuStream_bn,gd->cuEv_air_end,0) );
-         //boundary updates (using intermediate buffer)
-         if (!async_single_gpu)
-            gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_start,gd->cuStream_bn) );
-
-         //boundary updates
-         if (sd->fcc_flag==0) {
-            KernelBoundaryRigidCart<<<gd->grid_dim_bn,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
-         }
-         else {
-            //B7: fold shares the air index space -> same int32/int64 guard
-            if (ghd->Npts < INT32_MAX) {
-               KernelFoldFCC<int32_t><<<gd->grid_dim_fold,gd->block_dim_fold,0,gd->cuStream_bn>>>(gd->u1);
-            }
-            else {
-               KernelFoldFCC<int64_t><<<gd->grid_dim_fold,gd->block_dim_fold,0,gd->cuStream_bn>>>(gd->u1);
-            }
-            KernelBoundaryRigidFCC<<<gd->grid_dim_bn,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
-         }
-         // Keep the three-slot pressure carry; only the gather/scatter intermediates are fused.
-#ifdef BOUNDARY_SEPARATE
-         CopyFromGridKernel<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0b, gd->u0, gd->bnl_ixyz, ghd->Nbl);
-         //possible this could be moved to host
-         KernelBoundaryFD<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
-         //copy to back to grid
-         CopyToGridKernel<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0, gd->u0b, gd->bnl_ixyz, ghd->Nbl);
-#else
-         KernelBoundaryFDGrid<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->bnl_ixyz,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
-#endif
-         gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_end,gd->cuStream_bn) );
-
-         //air updates (including source
-         gpuErrchk( cudaStreamWaitEvent(gd->cuStream_air,gd->cuEv_bn_roundtrip_end,0) ); //might as well wait
-         //run air kernel (with mask)
-         if (!async_single_gpu)
-            gpuErrchk( cudaEventRecord(gd->cuEv_air_start,gd->cuStream_air) );
-
-         //for absorbing boundaries at boundaries of grid
-         CopyFromGridKernel<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u2ba, gd->u0, gd->bna_ixyz, ghd->Nba);
-#ifdef HALO_SEPARATE
-         const bool separate_halos = true; //B11 A/B reference
-#else
-         const bool separate_halos = !pffdtd::halo_faces_fusable(sd->Nz,sd->Ny);
-#endif
-         if (separate_halos) {
-         //Ordered faces also handle three-cell axes whose mirrors touch opposite halos.
-         if (gid==0) {
-            FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
-         }
-         if (gid==ngpus-1) {
-            FlipHaloXY_Zend<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
-         }
-         FlipHaloXZ_Ybeg<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,gd->cuStream_air>>>(gd->u1);
-         if (sd->fcc_flag==0) {
-            FlipHaloXZ_Yend<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,gd->cuStream_air>>>(gd->u1);
-         }
-         FlipHaloYZ_Xbeg<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
-         FlipHaloYZ_Xend<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
-         }
-         else {
-         //B11: conditional faces separate (different guards), 3 always-present faces fused.
-         //For axes >=4, XZ_Yend has no dependency on XZ_Ybeg, so it can precede
-         //the fused launch. XY faces are always completed first on this stream.
-         if (gid==0) {
-            FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
-         }
-         if (gid==ngpus-1) {
-            FlipHaloXY_Zend<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
-         }
-         if (sd->fcc_flag==0) {
-            FlipHaloXZ_Yend<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,gd->cuStream_air>>>(gd->u1);
-         }
-         {
-            int64_t amax = (sd->Nz > sd->Ny) ? sd->Nz : sd->Ny;  //a-axis covers max(Nx_kernel=Nz, Ny)
-            dim3 bdh(cuBx2, cuBy2, 1);
-            dim3 gdh(CU_DIV_CEIL(amax,cuBx2), CU_DIV_CEIL(ghd->Nxh,cuBy2), 3);
-            if (ghd->Npts < INT32_MAX) {
-               FlipHaloFaces<int32_t><<<gdh,bdh,0,gd->cuStream_air>>>(gd->u1);
-            }
-            else {
-               FlipHaloFaces<int64_t><<<gdh,bdh,0,gd->cuStream_air>>>(gd->u1);
-            }
-         }
-         }
-
-         //injecting source first, negation done inside kernel (NB source on different stream than bn)
-         if (ghd->Ns>0) {
-            AddInBatch<<<CU_DIV_CEIL(ghd->Ns,cuBrw),cuBrw,0,gd->cuStream_air>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,n);
-         }
-         //now air updates (not conflicting with bn updates because of bn_mask)
-         if (sd->fcc_flag==0) {
-            //B7: 32-bit index path when per-GPU grid fits (Npts<INT32_MAX), else int64 fallback
-            if (ghd->Npts < INT32_MAX) {
-               KernelAirCart<int32_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
-            }
-            else {
-               KernelAirCart<int64_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
-            }
-         }
-         else {
-            //B7: 32-bit index path when per-GPU grid fits (Npts<INT32_MAX), else int64 fallback
-            if (ghd->Npts < INT32_MAX) {
-               KernelAirFCC<int32_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
-            }
-            else {
-               KernelAirFCC<int64_t><<<gd->grid_dim_air,gd->block_dim_air,0,gd->cuStream_air>>>(gd->u0,gd->u1,gd->bn_mask);
-            }
-         }
-         //boundary ABC loss
-         KernelBoundaryABC<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u0,gd->u2ba,gd->Q_bna,gd->bna_ixyz);
-         gpuErrchk( cudaEventRecord(gd->cuEv_air_end,gd->cuStream_air) ); //dependency, plus reference timing
-
-         //readouts (write into block column col; drain D2H in batches of READOUT_BLOCK steps)
-         int64_t col = plan.col;
-         CopyFromGridKernel<<<gd->grid_dim_readout,gd->block_dim_readout,0,gd->cuStream_bn>>>(gd->u_out_buf + col*ghd->Nr, gd->u1, gd->out_ixyz, ghd->Nr);
-         if (!async_single_gpu)
-            gpuErrchk( cudaEventRecord(gd->cuEv_readout_end,gd->cuStream_bn) );
+         launch_gpu_step(sd,gd,ghd,gid,ngpus,n,async_single_gpu,false,READOUT_BLOCK);
+      }
       }
 
       //readouts: drain only at block boundary (or last step) -> single D2H of filled columns
@@ -1266,13 +1497,15 @@ double run_sim(const struct SimData *sd)
             gpuErrchk( cudaSetDevice(gid) );
             struct gpuData *gd = &(gds[gid]);
             struct gpuHostData *ghd = &(ghds[gid]);
-            if (async_single_gpu) {
+            cudaStream_t drain_stream = graphs_single_gpu ? gd->cuStream_air : gd->cuStream_bn;
+            if (async_single_gpu && !graphs_single_gpu) {
                // Drain completes both streams; buffer columns cannot be reused before D2H.
                gpuErrchk( cudaStreamWaitEvent(gd->cuStream_bn,gd->cuEv_air_end,0) );
                gpuErrchk( cudaPeekAtLastError() );
             }
-            gpuErrchk( cudaMemcpyAsync(ghd->u_out_buf, gd->u_out_buf, (size_t)(ghd->Nr*ncol*sizeof(Real)), cudaMemcpyDeviceToHost, gd->cuStream_bn) );
-            gpuErrchk( cudaStreamSynchronize(gd->cuStream_bn) );
+            if (graphs_single_gpu) gpuErrchk( cudaPeekAtLastError() );
+            gpuErrchk( cudaMemcpyAsync(ghd->u_out_buf, gd->u_out_buf, (size_t)(ghd->Nr*ncol*sizeof(Real)), cudaMemcpyDeviceToHost, drain_stream) );
+            gpuErrchk( cudaStreamSynchronize(drain_stream) );
             //despancio: host buffer laid out [col*Nr + nr]
             for (int64_t c=0; c<ncol; c++) {
                for (int64_t nr=0; nr<ghd->Nr; nr++) {
@@ -1341,24 +1574,17 @@ double run_sim(const struct SimData *sd)
          gpuErrchk( cudaStreamSynchronize(gd->cuStream_bn) ); //transfer complete
       }
       }
+      if (!graphs_single_gpu) {
       for (int gid=0; gid < ngpus; gid++) {
          struct gpuData *gd = &(gds[gid]);
          //update pointers
-         Real *tmp_ptr; 
-         tmp_ptr = gd->u1;
-         gd->u1 = gd->u0;
-         gd->u0 = tmp_ptr;
-
-         //will use extra vector for this (simpler than extra copy kernel)
-         tmp_ptr = gd->u2b;
-         gd->u2b = gd->u1b;
-         gd->u1b = gd->u0b;
-         gd->u0b = tmp_ptr;
+         rotate_gpu_pointers(gd);
 
          if (gid==0 && !async_single_gpu) {
             gpuErrchk( cudaSetDevice(gid) );
             gpuErrchk( cudaEventRecord(cuEv_main_sample_end,0) );
          }
+      }
       }
 
       if (!async_single_gpu) {
@@ -1411,6 +1637,15 @@ double run_sim(const struct SimData *sd)
     * FREE WILLY 
    ------------------------*/
    gpuErrchk( cudaSetDevice(0) );
+   if (graphs_single_gpu) {
+      for (int kind=0; kind<2; kind++) {
+         for (int phase=0; phase<6; phase++) {
+            if (graph_exec[kind][phase])
+               gpuErrchk( cudaGraphExecDestroy(graph_exec[kind][phase]) );
+         }
+      }
+      gpuErrchk( cudaFree(graph_step_base) );
+   }
    gpuErrchk( cudaEventDestroy(cuEv_main_start) );
    gpuErrchk( cudaEventDestroy(cuEv_main_end) );
    gpuErrchk( cudaEventDestroy(cuEv_main_sample_start) );
@@ -1431,6 +1666,7 @@ double run_sim(const struct SimData *sd)
       gpuErrchk( cudaEventDestroy(gd->cuEv_readout_end) );
 
       //free memory
+      gpuErrchk( cudaFree(gd->boundary_lossy_map) );
       gpuErrchk( cudaFree(gd->u0) );
       gpuErrchk( cudaFree(gd->u1) );
       gpuErrchk( cudaFree(gd->out_ixyz) );
@@ -1477,6 +1713,10 @@ double run_sim(const struct SimData *sd)
    else {
       printf("Boundary loop: %.6fs, %.2f Mvox/s\n",time_elapsed_bn,sd->Nb*sd->Nt/1e6/time_elapsed_bn);
       printf("Air update: %.6fs, %.2f Mvox/s\n",time_elapsed_air,sd->Npts*sd->Nt/1e6/time_elapsed_air);
+   }
+   if (graphs_single_gpu) {
+      printf("CUDA Graphs: %d cache entries, %ld replays, %ld scalar steps; host capture/instantiate %.6fs (included in total wall).\n",
+             graph_cache_entries,(long)graph_replays,(long)graph_scalar_steps,graph_setup_seconds);
    }
    printf("Combined (total): %.6fs, %.2f Mvox/s\n",time_elapsed,sd->Npts*sd->Nt/1e6/time_elapsed);
    return time_elapsed;

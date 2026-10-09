@@ -153,7 +153,25 @@ timesteps without per-step host barriers and drains output every 512 samples or
 at the final partial block. The synchronous scheduler remains the default and
 is used for multiple GPUs or receivers on ghost faces. `SCHEDULER_SYNC` forces
 the reference at compile time; `PFFDTD_PROGRESS=0` disables progress output.
-CUDA regression tests include full-engine comparisons of both runtime modes;
+`PFFDTD_GRAPHS=1` selects reusable single-stream CUDA Graphs instead: packets of
+96 or 6 steps preserve the two/three-buffer rotations, a device counter advances
+source samples and output columns, and scalar tails stop at each output drain.
+Graphs imply the asynchronous mode and have the same device/receiver guards.
+Capture and instantiation time is included in the reported wall time.
+
+`PFFDTD_BOUNDARY_FUSED=1` combines the rigid stencil and ADE correction in one
+kernel. It validates a boundary-to-lossy map while retaining the three pressure
+carry buffers and pole state layout. This removes an intermediate grid write/read
+and a launch, but adds a map lookup for every boundary node. The default keeps
+the ordered reference; `BOUNDARY_SEPARATE` overrides the runtime fusion option.
+With boundary fusion enabled, `PFFDTD_ADE_MODE=reload` uses two scalar passes
+that reread unchanged ADE states and eliminate the temporary history arrays.
+`PFFDTD_ADE_MODE=fixed` unrolls pole counts 0/1/11/12, using the scalar path for
+other counts; it increases register use substantially. The default is `generic`.
+Select either variant only after comparing numerical results and timings on the
+target GPU; removing local arrays alone does not establish a speedup.
+
+CUDA regression tests include full-engine comparisons of the runtime modes;
 select one device with `CUDA_VISIBLE_DEVICES` before running them. GPU correctness
 and speedup must be checked on each target before adopting the asynchronous mode.
 
@@ -166,6 +184,22 @@ building a reference executable, retaining the normal includes and build flags.
 See [the CUDA audit](docs/CUDA_AUDIT.md) for the optimization plan and validation
 limits. Preparation and postprocessing still use the existing Python scripts;
 their native C++/CUDA replacements remain to be implemented.
+
+Build the native comparison harness with `make -C c_cuda benchmark` and the same
+architecture/library overrides as the engines. Run it from a prepared simulation
+directory containing the four input HDF5 files, for example:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 /tmp/pffdtd-ada/fdtd_bench_gpu_single.x --repetitions 12 --csv /tmp/pffdtd-ada-results.csv
+```
+
+The harness interleaves twelve scheduler/boundary/ADE variants, checks every output bit,
+and reports median/min/max wall time with GPU, CUDA and build revision metadata.
+It includes `run_sim` setup/cleanup and graph construction, excludes HDF5 loading
+and verification, and keeps the engine's differently clocked loop times separate.
+Each run resets the CUDA context. Existing CSV files require `--overwrite-csv`;
+simulation output files are not written. Run the CUDA regressions before using
+benchmark results to choose a variant for either target.
 
 The typical flow: build a model in Sketchup and export it (with source/receiver CSVs)
 to JSON via the provided plugin; fit absorption/impedance data; run a setup script

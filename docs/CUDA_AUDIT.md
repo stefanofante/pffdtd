@@ -182,3 +182,44 @@ Il percorso `PFFDTD_ASYNC=1` è ora implementato come catena di eventi: boundary
 Si eliminano le tre sincronizzazioni stream e l'attesa dell'evento di timing che il percorso precedente effettua a ogni passo. Rimangono i lanci dei kernel e gli eventi di dipendenza: questa modifica non è ancora CUDA Graphs. La telemetria asincrona riporta il wall time a blocchi e non inventa un breakdown air/boundary. `PFFDTD_PROGRESS=0` permette prove senza output di progresso. Il percorso multi-GPU rimane sincrono; ricevitori non interni fanno ripiegare sul riferimento. `SCHEDULER_SYNC` mantiene il riferimento anche quando l'opzione runtime è impostata.
 
 `tests/native/scheduler_plan_test.cpp` verifica 576 ordini topologici randomizzati con bank bulk/carry e campioni etichettati; rileva mutanti senza le dipendenze necessarie, copre indici temporali int64 e drain parziali. È una verifica del contratto delle dipendenze, non dell'API eventi CUDA. `tests/scheduler_cuda_check.cu` usa il solver completo con fixture C++ native, due sorgenti, ricevitori duplicati/interni, ABC, pannello con adiacenze reciproche e stato ADE. Confronta esattamente i campioni sync/async per Cart/FCC, FP32/FP64 e Nt=1,2,3,5,6,7,511,512,513,1025. Senza hardware esce con 77; la regressione GPU non è stata dichiarata passata.
+
+### CUDA Graphs riutilizzabili
+
+`PFFDTD_GRAPHS=1` usa lo stesso launcher della fisica dei percorsi sync/eventi, catturato su un unico stream non bloccante. I grafi da 96 e 6 passi chiudono le rotazioni bulk2/carry3; la cache è distinta per lunghezza e fase `n%6`. Le code dirette cambiano la fase dopo il drain a 512 campioni, quindi il solo grafo della fase iniziale non sarebbe sufficiente. Sorgenti e readout leggono un contatore device più offset; il contatore avanza dopo tutti i nodi del pacchetto. Il planner impedisce di attraversare il drain o il limite Nt. Nel blocco pieno si accodano cinque grafi da 96, cinque da 6 e due passi diretti. Il numero di API host si riduce strutturalmente; non è una misura dello speedup.
+
+Il readout nel grafo segue air e legge il campo `u1` interno, immutato da air; il controllo ricevitori protegge questa equivalenza. Un solo stream sacrifica la sovrapposizione readout/air del percorso a eventi e semplifica le dipendenze; confrontare i due sul device. La sincronizzazione iniziale include il contatore e tutto il setup sul default stream. Il costo di cattura/istanziazione è riportato separatamente come durata host e rimane incluso nel wall time, anche se parte può sovrapporsi a lavoro GPU già accodato. Cleanup dopo il completamento dei grafi, prima della liberazione dei buffer.
+
+`graph_plan.h` e il test nativo verificano 1.440 modelli randomizzati host/device: fasi dei puntatori, versioni sorgente/readout, riuso dell'output, code int64 e mutanti con contatore/fase errati. PASS anche ASan/UBSan. Il test completo CUDA è ampliato a 96 fixture per precisione, incluse Nt=95/96/97 e 1536/1537/3073, ricevitori direttamente sulle boundary, materiali con 0..12 poli e boundary rigide/dissipative miste. Ogni fixture confronta undici varianti col riferimento sincrono: 1.056 confronti per precisione. Le comparazioni device rimangono da eseguire.
+
+### Fusione completa dello stencil boundary e ADE
+
+`PFFDTD_BOUNDARY_FUSED=1` evita la pressione intermedia globale fra rigid stencil e ADE. Una mappa validata associa ogni boundary al suo ordinal dissipativo, o -1 per rigido; preserva gli ordini originali, usa int32 quando basta e int64 altrimenti. Indici duplicati, fuori griglia o dissipativi assenti dalla boundary sono errori espliciti. Gli input ordinati usano una costruzione lineare; solo quelli disordinati richiedono copie ordinate. Si conserva il layout degli stati, l'aritmetica e la rotazione dei tre carry. `BOUNDARY_SEPARATE` forza il riferimento.
+
+Rispetto a rigid + FDGrid si elimina un lancio e si risparmiano nominalmente `(8+2*sizeof(Real))*Nbl - sizeof(MapIdx)*Nb` byte per passo: si rimuovono indice dissipativo e store/load della pressione, aggiungendo la mappa per ogni boundary. Per poche boundary dissipative il bilancio può diventare negativo. La memoria device cresce di `Nb*sizeof(MapIdx)`; il setup host aggiunge il buffer e lo staging della mappa, oltre alle coppie indice/ordinale per input disordinati. Si tratta di accessi espliciti e memoria allocata, non di traffico DRAM misurato.
+
+PASS 4.101 casi della mappa e, per precisione, 2.820 casi stencil/ADE x37 passi con riferimento stencil indipendente e ADE CPU esistente; PASS ASan/UBSan. Il test CUDA dedicato prepara 257 boundary, campi e stati non nulli e confronta interamente griglia, carry, poli inattivi e padding: 348 casi x37 passi per precisione, Cart/FCC, map32/64, tre modalità ADE e tutti i poli 0..12. Compilazioni Ada/GB10 riuscite; esecuzioni SKIP77 senza device.
+
+Il report ptxas CUDA13 per il kernel fuso generico mostra 40 registri FP32 e 44 FP64 su Ada; su GB10 48 Cart FP32, 64 FCC FP32 e 64 FP64. FDGrid usa rispettivamente 40/40 e 48/64. Gli array ADE mantengono 96 B di stack FP32 e 192 B FP64; zero spill dichiarati non equivale all'assenza di memoria locale. Il maggiore costo in registri FCC sul GB10 rende obbligatorio un confronto di occupazione e tempo, anche se si elimina un lancio.
+
+### Harness nativo per scegliere le varianti
+
+`fdtd_bench.cu` legge input HDF5 già preparati, confronta varianti interleaved e rifiuta campioni non finiti o diversi dal riferimento sincrono. L'output viene prima inizializzato a NaN per rilevare scritture mancanti. Riporta mediana, minimo, massimo e dispersione, con GPU, CUDA, precisione, griglia, conteggi e revisione di build in CSV. La metrica comune è il wall time esterno di `run_sim`, inclusi setup, trasferimenti, grafi, cleanup e reset; HDF5, scaling e verifica sono esclusi. I tempi del loop hanno clock diversi e sono etichettati separatamente. Ogni run ricrea il contesto: il warmup non conserva allocazioni o grafi. Clock, potenza e temperatura devono essere raccolti esternamente e non sono misurati dal harness.
+
+Il confronto richiede una GPU visibile, ricevitori interni e sorgenti distinte. Non scrive gli HDF5 di output; il CSV richiede una scelta esplicita per sovrascrivere e protegge gli input. Assenza di device restituisce 77. Questo rende il benchmark eseguibile su entrambi i target senza calcolo Python, ma non sostituisce i gate numerici e di stabilità.
+
+### ADE senza array locali: reload e poli fissi
+
+Con la fusione boundary attiva, `PFFDTD_ADE_MODE=reload` conserva solo due scalari per polo: il primo passaggio calcola la pressione senza modificare stati, il secondo rilegge gli stessi stati globali e li aggiorna. Ogni nodo possiede ordinal e slot distinti; non legge valori aggiornati da altri nodi. Si elimina lo stack degli array dinamici al costo di due riletture globali per polo, potenzialmente servite dalla cache. `fixed` srotola 0/1/11/12 poli e usa reload per gli altri conteggi, mantenendo l'ordine della riduzione. Il default `generic` resta disponibile.
+
+Il report ptxas per i kernel stencil/ADE integrati, con entrambe le larghezze della mappa, è il seguente. Reload e fixed hanno stack zero e nessuno spill dichiarato in tutte le build; generic ha 96/192 B di stack.
+
+| Target | Precisione | Generic, registri | Reload, registri | Fixed, registri |
+|---|---|---:|---:|---:|
+| Ada sm_89 | FP32 | 40 | 39 | 96 |
+| Ada sm_89 | FP64 | 44 | 44 | 166 |
+| GB10 sm_121 | FP32 | 48 Cart / 64 FCC | 48 | 80 |
+| GB10 sm_121 | FP64 | 64 | 48 Cart / 56 FCC | 166 |
+
+Si tratta di conteggi del compilatore CUDA13, non di latenza, occupazione osservata o DRAM misurata. Fixed impone un costo elevato in registri anche ai nodi rigidi dello stesso kernel: non promuoverlo come scelta massima senza il benchmark. Il harness confronta dodici combinazioni scheduler/boundary/ADE con ordine Williams bilanciato su dodici round; il default è un warmup e dodici ripetizioni. Gli input nulli/non finiti e le sorgenti duplicate sono rifiutati.
+
+`boundary_fd_specialized_test.cpp` confronta reload/fixed con ADE CPU indipendente su 56 casi x37 passi per precisione, inclusi tutti i poli, area nulla, materiali misti e zero poli con stati nulli: PASS anche ASan/UBSan. I test stencil completi e CUDA esercitano inoltre la fusione in tutti e tre i modi. I guadagni prestazionali e l'equivalenza sul device restano da misurare su ciascun target.

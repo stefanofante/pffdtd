@@ -19,6 +19,7 @@ NVCC = nvcc
 IDIR = .
 BUILD_DIR ?= .
 CUDA_ARCH ?= native
+BUILD_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null)$(if $(shell git status --porcelain --untracked-files=no 2>/dev/null),-dirty,)
 
 #set the HDF5 env variables for your system
 
@@ -62,6 +63,16 @@ gpu: gpu_double gpu_single
 
 all: cpu gpu
 
+benchmark: benchmark_double benchmark_single
+
+benchmark_double:
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -std=c++11 fdtd_bench.cu -o $(BUILD_DIR)/fdtd_bench_gpu_double.x -DPRECISION=2 -DUSING_CUDA=true -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(CULDFLAGS)
+
+benchmark_single:
+	mkdir -p $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -std=c++11 fdtd_bench.cu -o $(BUILD_DIR)/fdtd_bench_gpu_single.x -DPRECISION=1 -DUSING_CUDA=true -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(CULDFLAGS)
+
 #build cpu/gpu double/single precision binaries
 cpu_double:
 	mkdir -p $(BUILD_DIR)
@@ -96,7 +107,31 @@ test-scheduler:
 	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -I$(IDIR) ../tests/native/scheduler_plan_test.cpp -o $(BUILD_DIR)/scheduler_plan_test.x
 	$(BUILD_DIR)/scheduler_plan_test.x
 
-test-native: test-halo test-boundary test-scheduler
+test-graph-plan:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -I$(IDIR) ../tests/native/graph_plan_test.cpp -o $(BUILD_DIR)/graph_plan_test.x
+	$(BUILD_DIR)/graph_plan_test.x
+
+test-boundary-map:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -I$(IDIR) ../tests/native/boundary_map_test.cpp -o $(BUILD_DIR)/boundary_map_test.x
+	$(BUILD_DIR)/boundary_map_test.x
+
+test-boundary-stencil:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -frounding-math -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/boundary_stencil_test.cpp -o $(BUILD_DIR)/boundary_stencil_single_test.x -DPRECISION=1 -DUSING_CUDA=false $(LDFLAGS)
+	OMP_NUM_THREADS=2 $(BUILD_DIR)/boundary_stencil_single_test.x
+	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -frounding-math -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/boundary_stencil_test.cpp -o $(BUILD_DIR)/boundary_stencil_double_test.x -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
+	OMP_NUM_THREADS=2 $(BUILD_DIR)/boundary_stencil_double_test.x
+
+test-ade-variants:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/boundary_fd_specialized_test.cpp -o $(BUILD_DIR)/boundary_fd_specialized_single_test.x -DPRECISION=1 -DUSING_CUDA=false $(LDFLAGS)
+	OMP_NUM_THREADS=2 $(BUILD_DIR)/boundary_fd_specialized_single_test.x
+	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/boundary_fd_specialized_test.cpp -o $(BUILD_DIR)/boundary_fd_specialized_double_test.x -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
+	OMP_NUM_THREADS=2 $(BUILD_DIR)/boundary_fd_specialized_double_test.x
+
+test-native: test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants
 
 build-cuda-tests:
 	mkdir -p $(BUILD_DIR)
@@ -105,6 +140,8 @@ build-cuda-tests:
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_fd_cuda_check.cu -o $(BUILD_DIR)/boundary_fd_double_cuda_test.x -DPRECISION=2 -DUSING_CUDA=true $(CULDFLAGS)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/scheduler_cuda_check.cu -o $(BUILD_DIR)/scheduler_single_cuda_test.x -DPRECISION=1 -DUSING_CUDA=true $(CULDFLAGS)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/scheduler_cuda_check.cu -o $(BUILD_DIR)/scheduler_double_cuda_test.x -DPRECISION=2 -DUSING_CUDA=true $(CULDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_stencil_cuda_check.cu -o $(BUILD_DIR)/boundary_stencil_single_cuda_test.x -DPRECISION=1 -DUSING_CUDA=true $(CULDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_stencil_cuda_check.cu -o $(BUILD_DIR)/boundary_stencil_double_cuda_test.x -DPRECISION=2 -DUSING_CUDA=true $(CULDFLAGS)
 
 # Tests return 77 when no CUDA device is visible; preserve that result.
 test-cuda: build-cuda-tests
@@ -113,8 +150,10 @@ test-cuda: build-cuda-tests
 	$(BUILD_DIR)/boundary_fd_double_cuda_test.x
 	$(BUILD_DIR)/scheduler_single_cuda_test.x
 	$(BUILD_DIR)/scheduler_double_cuda_test.x
+	$(BUILD_DIR)/boundary_stencil_single_cuda_test.x
+	$(BUILD_DIR)/boundary_stencil_double_cuda_test.x
 
-.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single test-halo test-boundary test-scheduler test-native build-cuda-tests test-cuda clean
+.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single benchmark benchmark_double benchmark_single test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-native build-cuda-tests test-cuda clean
 
 clean:
 	rm -f $(BUILD_DIR)/*.x
