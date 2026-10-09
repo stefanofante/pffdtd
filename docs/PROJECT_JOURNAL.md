@@ -175,3 +175,20 @@ REALE e irriducibile (11 poli usati), non padding.
 padding gia' piccolo; layout gia' coalescato). Risparmio solo VRAM: ~31 MB su 128 GB.
 **Verdetto:** padding fuori dal traffico + <2% -> archiviato, nessun codice.
 Come B10, l'audit aveva il meccanismo invertito (pensava si leggesse MMb, si legge cuMb).
+
+---
+
+## 2026-10-09 — Audit CUDA: dipendenze halo e piano Ada/GB10
+**Contesto:** riesame del forward e della pipeline completa per RTX 4500 Ada e
+DGX Spark GB10, con calcolo numerico nativo C/C++/CUDA.
+**Modifiche:** `docs/CUDA_AUDIT.md` documenta i finding sul commit `ad169d2`,
+la dipendenza read-after-write tra facce nel kernel B11, le barriere host,
+la pipeline boundary e il piano di migrazione del preprocessing/postprocessing.
+**Razionale:** la disgiunzione delle scritture B11 non elimina la lettura YZ
+da una cella aggiornata da XZ. Il modello host produce valori diversi per
+due ordini consentiti ai blocchi; FCC legge i corner interessati.
+**Esito:** PASS compilazione host FP32/FP64 e modello C delle dipendenze.
+Nessuna simulazione Python eseguita. Analisi e prove host; nessun nuovo
+benchmark GPU o gate RIR, in assenza di dispositivo/toolkit nella macchina.
+**Aperto:** correggere B11, introdurre regressioni native, validare su GPU;
+poi scheduler e boundary con gate numerici e benchmark separati per target.
