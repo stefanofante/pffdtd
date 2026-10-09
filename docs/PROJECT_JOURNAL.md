@@ -454,3 +454,18 @@ zero Cart/FCC1/FCC2; strict e ASan/UBSan/leaks FP32/FP64. Gain e campioni
 normali confrontati bit-exact col riferimento precedente.
 **Aperto:** amplitudesubnormaliche richiedono fattore infinito sono rifiutate;
 nessuna modifica allo schema FDTD o claim di prestazioni CUDA.
+
+---
+
+## 2026-10-09 — README allineato alla pipeline nativa completa
+**Contesto:** due paragrafi del README indicavano ancora prepare mesh, aria e
+WAV come port da completare, contraddicendo la guida e il codice pubblicati.
+**Modifiche:** aggiornati requisiti, comandi di build, BVH/CUB, filtri aria,
+modal FFT, WAV e verifica CPU/CUDA completa. Corretta la distinzione fra
+architettura GPU e host; gli scambi multi-GPU usano il runtime peer-copy e
+non hanno un fallback pinned-host esplicito implementato. Aggiunti stato dei
+gate e limite FP32 del confronto CTK, mantenendo separato il fitting di nuovi
+materiali dall'import dei DEF esistenti.
+**Esito:** revisione contro Makefile, CLI, engine e guida; controllo dei link
+locali, opzioni documentate e whitespace. Modifica solo documentale, senza
+nuovi calcoli o ripetizione dei test numerici già passati.

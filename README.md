@@ -24,11 +24,11 @@
 PFFDTD is a finite-difference time-domain (FDTD) simulator for 3D room acoustics: it
 computes room impulse responses on a regular grid, using a 7-point Cartesian or a
 13-point face-centred-cubic (FCC) stencil, with frequency-dependent impedance
-boundaries. It runs multi-GPU on CUDA, conserves energy to machine precision in
-double, and ships single-precision stability safeguards plus a staircase
-surface-area correction for more consistent decay-time estimates. It is fast,
-well-validated, and a clean wave-based reference — which is exactly why it is the
-base for this fork.
+boundaries. CPU and CUDA engines support single and double precision, with
+multi-GPU forward execution, single-precision source safeguards and staircase
+surface-area correction. The native pipeline covers mesh preparation through
+final RIR and WAV output. Current numerical evidence and hardware checks are
+recorded in [the CUDA audit](docs/CUDA_AUDIT.md).
 
 ## Why this fork exists
 
@@ -65,7 +65,7 @@ discontinuous-Galerkin wave engine method-against-method.
 
 ## Optimizations applied vs upstream
 
-The following changes have been made to the GPU engine relative to
+The following changes extend the simulator relative to
 [bsxfun/pffdtd](https://github.com/bsxfun/pffdtd). Forward optimizations retain
 the Cartesian/FCC update scheme. The latest native preparation also corrects
 sound speed, reciprocal links and surface factors; see the compatibility rules
@@ -73,13 +73,15 @@ in [the native guide](docs/NATIVE_PIPELINE.md) and the evidence in
 [the CUDA audit](docs/CUDA_AUDIT.md). CUDA runtime and performance gates for the
 new variants require execution on each target GPU.
 
-- **Build target.** Upstream compiled for `sm_35` (Kepler), which runs in
-  PTX-JIT compatibility mode on modern GPUs. Now `-arch=native` plus
-  `-Xptxas -O3`, producing a real binary for the host architecture.
-- **Multi-GPU peer access.** Upstream issued `cudaMemcpyPeerAsync` for halo
-  exchange without ever enabling P2P, silently staging transfers through host
-  RAM. Now `cudaDeviceEnablePeerAccess` is set up for every accessible device
-  pair, with an explicit host-staging fallback when P2P is unavailable.
+- **Build targets.** `CUDA_ARCH` selects GPU device code, with explicit
+  `sm_89` for Ada and `sm_121` for GB10; the default is `native`.
+  The host compiler separately determines whether the executable runs on
+  x86-64 or ARM64. CUDA preparation uses C++17 and CUB.
+- **Multi-GPU peer access.** Available peer access is enabled with
+  `cudaDeviceEnablePeerAccess`. Halo exchange uses `cudaMemcpyPeerAsync`;
+  the application has no explicit pinned-host staging route for devices
+  without peer access. Multi-GPU behavior requires runtime checks on that
+  topology.
 - **Batched source injection.** Upstream launched one `<<<1,1>>>` kernel per
   source per timestep (Ns x Nt micro-launches). Now a single batched kernel
   per timestep over all sources, with source signals and indices uploaded to
@@ -87,8 +89,20 @@ new variants require execution on each target GPU.
 - **Blocked read-out.** Upstream did a per-timestep device-to-host copy plus
   synchronisation for the receiver outputs. Now outputs accumulate in a device
   buffer and drain in blocks, cutting per-step PCIe transfers and sync points.
+- **Halo, scheduler and boundary execution.** Composed halo reads fix a fused
+  read/write dependency. Optional event scheduling, reusable CUDA Graphs and
+  fused stencil/ADE variants retain ordered references for comparison.
+- **Native mesh preparation.** A shared FP64 BVH classifies Cartesian/FCC
+  links; CUDA retains geometry and axes on the device and compacts boundary
+  records in bounded batches. Preparation imports existing passive DEF
+  materials and corrects Kelvin sound speed, reciprocal links and surface
+  factors.
+- **Native output processing.** CPU/CUDA receiver reconstruction, filters,
+  resampling and ISO9613 air attenuation feed HDF5 and float32 WAV export.
+  An optional Chebyshev/FFT modal algorithm replaces quadratic recurrence
+  work with `O(K*N*log N)` work and a guarded recurrence fallback.
 
-Performance work is tuned on the hardware it runs on:
+The hardware targets are:
 
 - **NVIDIA RTX 4500 Ada Generation** (24 GB, dedicated VRAM) — the workstation baseline.
 - **NVIDIA DGX Spark (GB10 Grace-Blackwell)** — aarch64, 128 GB unified memory.
@@ -143,9 +157,10 @@ processes RIRs through filters, resampling, air attenuation and WAV export.
 See [the native pipeline guide](docs/NATIVE_PIPELINE.md) for complete commands.
 Numerical stages use C++/CUDA; the legacy Python tools remain available separately.
 
-Build on Linux with HDF5, a C++ compiler, nlohmann/json headers, and a compatible
-CUDA toolkit with cuFFT. CUDA preparation uses C++17 for CUB. Run `make all
-prepare post` in `c_cuda` (see the Makefile for library paths).
+Build on Linux with a C++17 compiler, OpenMP, HDF5 development files and
+nlohmann/json headers. GPU preparation and processing also require CUDA with
+CUB and cuFFT; CUDA 13 builds have been checked for both device targets.
+Override `NVCC`, `HDF5_INC`, `HDF5_LIB`, `JSON_INC` and `CUFFT_LIB` when needed.
 
 Use `CUDA_ARCH=sm_89` for RTX 4500 Ada or `CUDA_ARCH=sm_121` for GB10 with a
 compatible toolkit. The default remains `native`. GPU code for GB10 can be
@@ -154,8 +169,9 @@ and matching HDF5 libraries to run on DGX Spark. `BUILD_DIR` keeps generated fil
 outside the checkout, for example:
 
 ```sh
-make -C c_cuda -j2 gpu CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada
-make -C c_cuda test-native BUILD_DIR=/tmp/pffdtd-native
+make -C c_cuda -j2 cpu gpu prepare post benchmark fixture CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada
+# CPU preparation, processing and regression checks without CUDA:
+make -C c_cuda -j2 cpu prepare_cpu post_cpu test-native BUILD_DIR=/tmp/pffdtd-native
 make -C c_cuda test-cuda CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada-tests
 ```
 
@@ -186,16 +202,22 @@ CUDA regression tests include full-engine comparisons of the runtime modes;
 select one device with `CUDA_VISIBLE_DEVICES` before running them. GPU correctness
 and speedup must be checked on each target before adopting the asynchronous mode.
 
-The native tests use C/C++ and check mirror-halo dependencies and the fused
-boundary pressure/ADE states. CUDA tests compare device results; they return
-status 77 when no device is available, which is a skipped check. `HALO_SEPARATE`
+The native C/C++ tests cover halo and scheduler dependencies, boundary/ADE
+states, memory checks, mesh/BVH queries, Cart/FCC layout, HDF5 preparation,
+DSP/resampling, air/FFT algorithms, WAV export and source normalization.
+CUDA tests compare device results; they return status 77 when no device is
+available, which is a skipped check. `HALO_SEPARATE`
 and `BOUNDARY_SEPARATE` compiler defines retain the ordered-halo and three-pass
 boundary implementations for comparison. Define them through `NVCCFLAGS` when
 building a reference executable, retaining the normal includes and build flags.
 See [the CUDA audit](docs/CUDA_AUDIT.md) for the optimization plan and validation
-limits. General mesh preparation still uses the existing Python scripts;
-its native C++/CUDA replacement remains to be implemented. Analytical inputs
-and the core output processing can now run entirely in C++/CUDA.
+limits, and [the native guide](docs/NATIVE_PIPELINE.md) for complete CTK and
+Musikverein material mappings and preparation commands. `fdtd_prepare_cpu.x`
+and `fdtd_prepare_gpu.x` write five HDF5 files into a new directory and check
+them with the original solver loader. FCC folds by default for CUDA; CPU
+also accepts unfolded inputs prepared with `--fcc --no-fold`. The pipeline
+uses existing passive DEF materials; fitting new absorption data is a
+separate material-model workflow.
 
 Build the native comparison harness with `make -C c_cuda benchmark` and the same
 architecture/library overrides as the engines. Run it from a prepared simulation
@@ -236,12 +258,17 @@ CUDA execution and acoustic validation still require the hardware gates.
 
 Native output processing reads the original solver's `sim_outs.h5`, rebuilds
 physical receivers with `out_alpha`, applies integration/Butterworth high-pass,
-resampling and optional low-pass, and writes `r_out_f`/`Fs_f` in a new HDF5 file:
+resampling, optional low-pass and air attenuation, and writes `r_out_f`/`Fs_f`
+in a new HDF5 file. WAV export is optional:
 
 ```sh
 make -C c_cuda post_gpu CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada
 # Run the engine from the prepared directory to produce sim_outs.h5 first.
 /tmp/pffdtd-ada/fdtd_post_gpu.x --data-dir /tmp/pffdtd-panel --verify
+# Choose a different output when processing the same input again:
+/tmp/pffdtd-ada/fdtd_post_gpu.x --data-dir /tmp/pffdtd-panel --verify \
+  --air-filter modal --air-modal-method fft \
+  --output /tmp/pffdtd-panel/sim_outs_modal.h5 --save-wav
 ```
 
 Use `post_cpu` for a reference build without CUDA. Defaults match the original
@@ -252,23 +279,54 @@ forward/reverse stage. Orders 1..16 are supported. SOS pairing can differ from
 SciPy and the analytic Kaiser sinc resampler is a new implementation: processed
 samples are compared with tolerances, rather than promised bit-identical.
 
-The CUDA backend retains receiver data and scratch on one stream. Its default
-IIR mode is serial; `--iir-mode chunked` computes zero-state responses for
+Air attenuation supports `--air-filter none|stokes|ola|modal`. Temperature and
+humidity come from `sim_consts.h5`; `--air-pressure` sets ambient pressure in
+kPa, and `--air-window` selects the OLA window. Modal processing defaults to
+`--air-modal-method recurrence`; `fft` uses a Chebyshev approximation with
+automatic fallback when its cost or range is unsuitable.
+`--air-modal-tolerance` controls the interpolation error bound; FFT roundoff
+and acoustic accuracy require separate checks.
+
+The CUDA backend retains receiver data and scratch through DSP and air
+processing on one stream. Its default IIR mode is serial;
+`--iir-mode chunked` computes zero-state responses for
 64-sample chunks, propagates their affine carries, then filters chunks in
 parallel. It changes rounding and requires a device comparison before use.
-`--verify` compares every CUDA sample against the C++ reference with
-`1e-12 + 1e-8*abs(reference)` tolerance. The default output refuses overwrites;
+`--verify` compares every final CUDA sample, including air processing, against
+the C++ reference with `1e-12 + 1e-8*abs(reference)` tolerance.
+The default output refuses overwrites;
 `--overwrite` replaces an existing regular file while protecting input aliases
 and symlinks. `--save-raw` adds reconstructed receivers, and metadata records
-filters, backend, resampler and build revision. General mesh preparation,
-optional air absorption filters and WAV export still need native ports.
+filters, backend, resampler, atmosphere and build revision. `--save-wav` writes
+globally normalized float32 mono WAVs and adds native-amplitude WAVs when the
+global peak is below one. Silence remains finite. `--wav-dir` overrides the
+data directory. HDF5 is published before WAVs; a WAV failure reports that the
+processed HDF5 already exists.
 
-The typical flow: build a model in Sketchup and export it (with source/receiver CSVs)
-to JSON via the provided plugin; fit absorption/impedance data; run a setup script
-that voxelizes the scene and writes `.h5` inputs; run the CUDA engine over those `.h5`
-files; post-process `sim_outs.h5` into final RIRs. Single-precision GPU execution is
-generally the fastest. For the original tool's full documentation, examples and
-references, see [bsxfun/pffdtd](https://github.com/bsxfun/pffdtd).
+The complete flow is JSONRoomExport mesh plus passive DEF materials → native
+preparation → C/CUDA forward engine → native filters/resampling/air → HDF5/WAV.
+Sketchup and the provided export plugin can produce the input JSON with source
+and receiver positions. For the original tool's documentation and references,
+see [bsxfun/pffdtd](https://github.com/bsxfun/pffdtd).
+
+## Verification status
+
+Native regression and sanitizer checks passed, including real CTK preparation,
+1537-step CPU simulation, all three air filters, HDF5 and twelve WAV outputs.
+CTK and Musikverein meshes with repository materials also passed the original
+solver loader. These checks establish integration and numerical contracts;
+measured RIR accuracy and long-time stability require further validation.
+
+CUDA builds for Ada and GB10 passed on the cloud's x86-64 host. Its 28 CUDA
+test/benchmark/preparation/processing executions returned **77 (SKIP)** because
+no usable GPU was available. Target speedups and CUDA runtime correctness
+remain unmeasured; the GB10 executable also needs an ARM64 host build.
+
+In the CTK FCC folded/unfolded comparison at `h=0.15 m` and 1537 steps, FP64
+forward outputs passed the pointwise gate. Filtered FP32 outputs differed by
+**0.135% normalized RMS** and failed the stricter pointwise gate as the layout changed addition
+order. Select precision using the accuracy requirements and target benchmark.
+Exact conditions and error measurements are in the native guide and audit.
 
 ## Contact
 
