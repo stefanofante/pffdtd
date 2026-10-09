@@ -297,3 +297,24 @@ reload/fixed nelle48 istanze dei quattro build, rispetto a96/192 B generic.
 Build CUDA/fixture/benchmark PASS; device SKIP77, nessuna misura di velocità.
 **Aperto:** scegliere per GPU e densità solo dopo gate numerici e benchmark;
 stabilità lunga/RIR, budget memoria, temporal blocking e pipeline nativa.
+
+---
+
+## 2026-10-09 — Generatore nativo di scene HDF5 per benchmark
+**Contesto:** il harness CUDA richiedeva input già preparati; il vincolo vieta
+calcolo Python anche nella preparazione delle nuove scene di prova.
+**Modifiche:** CLI `fdtd_fixture.cpp` in C++/HDF5, target `fixture` e
+`test-fixture` incluso in `test-native`. Pannelli Cartesian reciproci,
+materiali RLC passivi con poli0..12, sorgenti distinte fuori boundary/ABC,
+ricevitori e metadati completi. Parametri per dimensioni, Nt, frazione rigida,
+materiali misti e densità dei pannelli. Verifica col loader originale e
+rifiuto directory esistenti; nessun calcolo Python.
+**Razionale:** rendere eseguibili i confronti Ada/GB10 con geometrie analitiche
+controllate, variando il costo ADE senza dipendere dalla voxelizzazione mesh.
+**Esito:** PASS26 round trip HDF5 per precisione anche ASan/UBSan.
+Smoke solver CPU originale FP32/FP64: scena8x9x10,3073 passi,13 materiali,
+Ns2/Nr6/Nb24/Nbl16,OMP2,exit0. Checker C++ conferma `u_out[6,3073]`:
+18.438 campioni finiti e18.420 non nulli per ciascuna precisione.
+**Aperto:** il generatore è analitico Cartesian, non una migrazione generale
+di mesh/FCC/fitting/postprocess. Gate CUDA, stabilità/RIR e misure per target
+restano aperti; nessun guadagno prestazionale dedotto dalla prova CPU.

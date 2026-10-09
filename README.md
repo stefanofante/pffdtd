@@ -182,8 +182,9 @@ and `BOUNDARY_SEPARATE` compiler defines retain the ordered-halo and three-pass
 boundary implementations for comparison. Define them through `NVCCFLAGS` when
 building a reference executable, retaining the normal includes and build flags.
 See [the CUDA audit](docs/CUDA_AUDIT.md) for the optimization plan and validation
-limits. Preparation and postprocessing still use the existing Python scripts;
-their native C++/CUDA replacements remain to be implemented.
+limits. General mesh preparation and postprocessing still use the existing
+Python scripts; their native C++/CUDA replacements remain to be implemented.
+Analytical benchmark inputs can now be generated entirely in C++.
 
 Build the native comparison harness with `make -C c_cuda benchmark` and the same
 architecture/library overrides as the engines. Run it from a prepared simulation
@@ -200,6 +201,27 @@ and verification, and keeps the engine's differently clocked loop times separate
 Each run resets the CUDA context. Existing CSV files require `--overwrite-csv`;
 simulation output files are not written. Run the CUDA regressions before using
 benchmark results to choose a variant for either target.
+
+Build the native HDF5 fixture generator with `make -C c_cuda fixture`, using
+the same HDF5 library overrides as the CPU engines. For example:
+
+```sh
+make -C c_cuda fixture BUILD_DIR=/tmp/pffdtd-native
+/tmp/pffdtd-native/fdtd_fixture.x --output /tmp/pffdtd-panel --nx 128 --ny 128 --nz 128 --steps 3073 --mixed-poles
+cd /tmp/pffdtd-panel
+CUDA_VISIBLE_DEVICES=0 /tmp/pffdtd-ada/fdtd_bench_gpu_single.x --repetitions 12 --csv /tmp/pffdtd-panel-results.csv
+```
+
+The generator writes all four solver input files, checks them with the original
+loader, and refuses an existing output directory. It creates Cartesian finite
+panels with reciprocal links, passive RLC materials, two differentiated sources
+and six receivers; it does not voxelize triangle meshes. Each axis needs at
+least eight cells. `--poles 0..12`, `--mixed-poles`, `--rigid-every N` and
+`--panel-spacing N` vary the ADE workload and panel density. Defaults are 32³,
+1537 steps, 11 poles, every third boundary rigid and one central panel.
+`test-native` includes 26 HDF5 round trips in each precision. A 3073-step mixed
+fixture also passed integration with the original CPU solver in FP32/FP64;
+CUDA execution and acoustic validation still require the hardware gates.
 
 The typical flow: build a model in Sketchup and export it (with source/receiver CSVs)
 to JSON via the provided plugin; fit absorption/impedance data; run a setup script

@@ -73,6 +73,16 @@ benchmark_single:
 	mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 fdtd_bench.cu -o $(BUILD_DIR)/fdtd_bench_gpu_single.x -DPRECISION=1 -DUSING_CUDA=true -DPFFDTD_BUILD_REVISION='"$(BUILD_REVISION)"' $(CULDFLAGS)
 
+fixture:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) fdtd_fixture.cpp -o $(BUILD_DIR)/fdtd_fixture.x -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
+
+test-fixture: fixture
+	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) fdtd_fixture.cpp -o $(BUILD_DIR)/fdtd_fixture_single.x -DPRECISION=1 -DUSING_CUDA=false $(LDFLAGS)
+	pffdtd_fixture_parent=$$(mktemp -d "$(BUILD_DIR)/fixture-check.XXXXXX") && \
+	$(BUILD_DIR)/fdtd_fixture_single.x --self-test "$$pffdtd_fixture_parent/fp1" && \
+	$(BUILD_DIR)/fdtd_fixture.x --self-test "$$pffdtd_fixture_parent/fp2"
+
 #build cpu/gpu double/single precision binaries
 cpu_double:
 	mkdir -p $(BUILD_DIR)
@@ -131,7 +141,7 @@ test-ade-variants:
 	$(CXX) -std=c++11 -O2 -Wall -Wextra -Wpedantic -ffp-contract=off -I$(IDIR) -I$(HDF5_INC) ../tests/native/boundary_fd_specialized_test.cpp -o $(BUILD_DIR)/boundary_fd_specialized_double_test.x -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
 	OMP_NUM_THREADS=2 $(BUILD_DIR)/boundary_fd_specialized_double_test.x
 
-test-native: test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants
+test-native: test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-fixture
 
 build-cuda-tests:
 	mkdir -p $(BUILD_DIR)
@@ -153,7 +163,7 @@ test-cuda: build-cuda-tests
 	$(BUILD_DIR)/boundary_stencil_single_cuda_test.x
 	$(BUILD_DIR)/boundary_stencil_double_cuda_test.x
 
-.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single benchmark benchmark_double benchmark_single test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-native build-cuda-tests test-cuda clean
+.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single benchmark benchmark_double benchmark_single fixture test-fixture test-halo test-boundary test-scheduler test-graph-plan test-boundary-map test-boundary-stencil test-ade-variants test-native build-cuda-tests test-cuda clean
 
 clean:
 	rm -f $(BUILD_DIR)/*.x
