@@ -43,6 +43,7 @@
 #include <omp.h>
 #endif
 #include <halo_faces.h>
+#include <scheduler_plan.h>
 
 #define CU_DIV_CEIL(x,y) ((DIV_CEIL(x,y)==0)? (1) : (DIV_CEIL(x,y))) //want 0 to map to 1, otherwise kernel errors
 
@@ -764,6 +765,15 @@ double run_sim(const struct SimData *sd)
       exit(EXIT_FAILURE);
    }
    ngpus = max_ngpus; 
+   bool async_single_gpu = pffdtd::scheduler_async_requested(ngpus,getenv("PFFDTD_ASYNC"));
+   if (async_single_gpu && !pffdtd::scheduler_receivers_interior(
+         sd->out_ixyz,sd->Nr,sd->Nx,sd->Ny,sd->Nz)) {
+      fprintf(stderr,"PFFDTD_ASYNC: halo or invalid receiver indices require the synchronous scheduler.\n");
+      async_single_gpu = false;
+   }
+   printf("Scheduler: %s\n",async_single_gpu ? "single-GPU event chain (PFFDTD_ASYNC=1)" : "synchronous reference");
+   const char *progress_mode = getenv("PFFDTD_PROGRESS");
+   const bool progress_enabled = !(progress_mode && strcmp(progress_mode,"0") == 0);
    assert(ngpus < (sd->Nx));
    struct gpuData *gds;
    mymalloc((void **)&gds, ngpus*sizeof(gpuData)); 
@@ -1074,14 +1084,15 @@ double run_sim(const struct SimData *sd)
       gd->grid_dim_fold      = dim3(cuGx2,cuGz2,1);
 
       //create streams
-      gpuErrchk( cudaStreamCreate(&(gd->cuStream_air)) );
-      gpuErrchk( cudaStreamCreate(&(gd->cuStream_bn)) ); //no priority
+      const unsigned int stream_flags = async_single_gpu ? cudaStreamNonBlocking : cudaStreamDefault;
+      gpuErrchk( cudaStreamCreateWithFlags(&(gd->cuStream_air),stream_flags) );
+      gpuErrchk( cudaStreamCreateWithFlags(&(gd->cuStream_bn),stream_flags) ); //no priority
 
       //cuda events
       gpuErrchk( cudaEventCreate(&(gd->cuEv_air_start)) );
-      gpuErrchk( cudaEventCreate(&(gd->cuEv_air_end)) );
+      gpuErrchk( cudaEventCreateWithFlags(&(gd->cuEv_air_end),async_single_gpu ? cudaEventDisableTiming : cudaEventDefault) );
       gpuErrchk( cudaEventCreate(&(gd->cuEv_bn_roundtrip_start)) );
-      gpuErrchk( cudaEventCreate(&(gd->cuEv_bn_roundtrip_end)) );
+      gpuErrchk( cudaEventCreateWithFlags(&(gd->cuEv_bn_roundtrip_end),async_single_gpu ? cudaEventDisableTiming : cudaEventDefault) );
       gpuErrchk( cudaEventCreate(&(gd->cuEv_readout_end)) );
    }
    assert(Nb_read == sd->Nb);
@@ -1110,19 +1121,28 @@ double run_sim(const struct SimData *sd)
       assert(use32 || sizeof(int64_t)==8); //int64 fallback always valid; guard documents intent
    }
 
+   // Nonblocking streams do not inherit setup work queued on the legacy default stream.
+   if (async_single_gpu) gpuErrchk( cudaDeviceSynchronize() );
+   const double async_wall_start = async_single_gpu ? omp_get_wtime() : 0.0;
    for (int64_t n=0; n<sd->Nt; n++) { //loop over time-steps
+      const pffdtd::SchedulePlan plan = pffdtd::schedule_plan(n,sd->Nt,READOUT_BLOCK);
       for (int gid=0; gid < ngpus; gid++) { //loop over GPUs (one thread launches all kernels)
          gpuErrchk( cudaSetDevice(gid) );
          struct gpuData *gd = &(gds[gid]); //get struct of device pointers
          struct gpuHostData *ghd = &(ghds[gid]);//get struct of host points (corresponding to device)
 
          //start first timer
-         if (gid==0) {
+         if (gid==0 && !async_single_gpu) {
             if (n==0) gpuErrchk( cudaEventRecord(cuEv_main_start,0) ); //not sure if to put on stream, check slides again
             gpuErrchk( cudaEventRecord(cuEv_main_sample_start,0) );
          }
+         // A wait captures the previous event record before air_end is reused below.
+         // The same stream also orders readout(n-1) before boundary(n).
+         if (async_single_gpu && plan.wait_previous_air)
+            gpuErrchk( cudaStreamWaitEvent(gd->cuStream_bn,gd->cuEv_air_end,0) );
          //boundary updates (using intermediate buffer)
-         gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_start,gd->cuStream_bn) );
+         if (!async_single_gpu)
+            gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_start,gd->cuStream_bn) );
 
          //boundary updates
          if (sd->fcc_flag==0) {
@@ -1153,7 +1173,8 @@ double run_sim(const struct SimData *sd)
          //air updates (including source
          gpuErrchk( cudaStreamWaitEvent(gd->cuStream_air,gd->cuEv_bn_roundtrip_end,0) ); //might as well wait
          //run air kernel (with mask)
-         gpuErrchk( cudaEventRecord(gd->cuEv_air_start,gd->cuStream_air) );
+         if (!async_single_gpu)
+            gpuErrchk( cudaEventRecord(gd->cuEv_air_start,gd->cuStream_air) );
 
          //for absorbing boundaries at boundaries of grid
          CopyFromGridKernel<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u2ba, gd->u0, gd->bna_ixyz, ghd->Nba);
@@ -1228,22 +1249,28 @@ double run_sim(const struct SimData *sd)
          }
          //boundary ABC loss
          KernelBoundaryABC<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u0,gd->u2ba,gd->Q_bna,gd->bna_ixyz);
-         gpuErrchk( cudaEventRecord(gd->cuEv_air_end,gd->cuStream_air) ); //for timing
+         gpuErrchk( cudaEventRecord(gd->cuEv_air_end,gd->cuStream_air) ); //dependency, plus reference timing
 
          //readouts (write into block column col; drain D2H in batches of READOUT_BLOCK steps)
-         int64_t col = n % READOUT_BLOCK;
+         int64_t col = plan.col;
          CopyFromGridKernel<<<gd->grid_dim_readout,gd->block_dim_readout,0,gd->cuStream_bn>>>(gd->u_out_buf + col*ghd->Nr, gd->u1, gd->out_ixyz, ghd->Nr);
-         gpuErrchk( cudaEventRecord(gd->cuEv_readout_end,gd->cuStream_bn) );
+         if (!async_single_gpu)
+            gpuErrchk( cudaEventRecord(gd->cuEv_readout_end,gd->cuStream_bn) );
       }
 
       //readouts: drain only at block boundary (or last step) -> single D2H of filled columns
-      if ( (n % READOUT_BLOCK)==(READOUT_BLOCK-1) || n==sd->Nt-1 ) {
-         int64_t ncol = (n % READOUT_BLOCK) + 1; //filled columns in this block
-         int64_t base = n - (ncol-1);            //global step of first column
+      if (plan.checkpoint) {
+         int64_t ncol = plan.ncol; //filled columns in this block
+         int64_t base = plan.base; //global step of first column
          for (int gid=0; gid < ngpus; gid++) {
             gpuErrchk( cudaSetDevice(gid) );
             struct gpuData *gd = &(gds[gid]);
             struct gpuHostData *ghd = &(ghds[gid]);
+            if (async_single_gpu) {
+               // Drain completes both streams; buffer columns cannot be reused before D2H.
+               gpuErrchk( cudaStreamWaitEvent(gd->cuStream_bn,gd->cuEv_air_end,0) );
+               gpuErrchk( cudaPeekAtLastError() );
+            }
             gpuErrchk( cudaMemcpyAsync(ghd->u_out_buf, gd->u_out_buf, (size_t)(ghd->Nr*ncol*sizeof(Real)), cudaMemcpyDeviceToHost, gd->cuStream_bn) );
             gpuErrchk( cudaStreamSynchronize(gd->cuStream_bn) );
             //despancio: host buffer laid out [col*Nr + nr]
@@ -1253,8 +1280,16 @@ double run_sim(const struct SimData *sd)
                }
             }
          }
+         if (async_single_gpu) {
+            time_elapsed = omp_get_wtime() - async_wall_start;
+            if (progress_enabled)
+               printf("Running: %ld/%ld steps (%.1f%%), %.6fs wall, %.2f Mvox/s\n",
+                   (long)(n+1),(long)sd->Nt,100.0*(n+1)/sd->Nt,time_elapsed,
+                   sd->Npts*(double)(n+1)/1e6/time_elapsed);
+         }
       }
       //synchronise streams
+      if (!async_single_gpu) {
       for (int gid=0; gid < ngpus; gid++) {
          gpuErrchk( cudaSetDevice(gid) );
          struct gpuData *gd = &(gds[gid]); //don't really need to set gpu device to sync
@@ -1305,6 +1340,7 @@ double run_sim(const struct SimData *sd)
          struct gpuData *gd = &(gds[gid]);
          gpuErrchk( cudaStreamSynchronize(gd->cuStream_bn) ); //transfer complete
       }
+      }
       for (int gid=0; gid < ngpus; gid++) {
          struct gpuData *gd = &(gds[gid]);
          //update pointers
@@ -1319,13 +1355,13 @@ double run_sim(const struct SimData *sd)
          gd->u1b = gd->u0b;
          gd->u0b = tmp_ptr;
 
-         if (gid==0) {
+         if (gid==0 && !async_single_gpu) {
             gpuErrchk( cudaSetDevice(gid) );
             gpuErrchk( cudaEventRecord(cuEv_main_sample_end,0) );
          }
       }
 
-      {
+      if (!async_single_gpu) {
          //timing only on gpu0
          gpuErrchk( cudaSetDevice(0) );
          struct gpuData *gd = &(gds[0]);
@@ -1347,7 +1383,8 @@ double run_sim(const struct SimData *sd)
          time_elapsed_sample_bn = millis_bn/1000.0;
          time_elapsed_bn += time_elapsed_sample_bn;
 
-         print_progress(n, sd->Nt, sd->Npts, sd->Nb, time_elapsed, time_elapsed_sample, time_elapsed_air, time_elapsed_sample_air, time_elapsed_bn, time_elapsed_sample_bn, ngpus);
+         if (progress_enabled)
+            print_progress(n, sd->Nt, sd->Npts, sd->Nb, time_elapsed, time_elapsed_sample, time_elapsed_air, time_elapsed_sample_air, time_elapsed_bn, time_elapsed_sample_bn, ngpus);
       }
    }
    printf("\n");
@@ -1357,7 +1394,10 @@ double run_sim(const struct SimData *sd)
       gpuErrchk( cudaPeekAtLastError() );
       gpuErrchk( cudaDeviceSynchronize() );
    }
-   {
+   if (async_single_gpu) {
+      time_elapsed = omp_get_wtime() - async_wall_start;
+   }
+   else {
       //timing (on device 0)
       gpuErrchk( cudaSetDevice(0) );
       gpuErrchk( cudaEventRecord(cuEv_main_end) );
@@ -1431,8 +1471,13 @@ double run_sim(const struct SimData *sd)
       gpuErrchk( cudaDeviceReset() );
    }
 
-   printf("Boundary loop: %.6fs, %.2f Mvox/s\n",time_elapsed_bn,sd->Nb*sd->Nt/1e6/time_elapsed_bn);
-   printf("Air update: %.6fs, %.2f Mvox/s\n",time_elapsed_air,sd->Npts*sd->Nt/1e6/time_elapsed_air);
+   if (async_single_gpu) {
+      printf("Boundary/air kernel timing: not collected by the batched scheduler; use a CUDA profiler.\n");
+   }
+   else {
+      printf("Boundary loop: %.6fs, %.2f Mvox/s\n",time_elapsed_bn,sd->Nb*sd->Nt/1e6/time_elapsed_bn);
+      printf("Air update: %.6fs, %.2f Mvox/s\n",time_elapsed_air,sd->Npts*sd->Nt/1e6/time_elapsed_air);
+   }
    printf("Combined (total): %.6fs, %.2f Mvox/s\n",time_elapsed,sd->Npts*sd->Nt/1e6/time_elapsed);
    return time_elapsed;
 }

@@ -109,15 +109,16 @@ void print_progress(uint32_t n, uint32_t Nt, uint64_t Npts, uint64_t Nb,
                      double time_elapsed_bn, double time_elapsed_sample_bn, int num_workers) {
    //progress bar (doesn't impact performance unless simulation is really tiny)
    struct winsize w;
-   ioctl(0, TIOCGWINSZ, &w);
-   int ncols = w.ws_col;
+   memset(&w,0,sizeof(w));
+   bool terminal = ioctl(0, TIOCGWINSZ, &w) == 0 && w.ws_col > 0;
+   int ncols = terminal ? w.ws_col : 0;
    int ncolsl = 80;
    //int ncolsl = 120;
    //int ncolsp = w.ws_col-ncolsl;
 
-   double pcnt = (100.0*n)/Nt;
+   double pcnt = Nt ? (100.0*n)/Nt : 0.0;
    int nlines = 6;
-   if (n>0) {
+   if (n>0 && terminal) {
       //back up
       for (int nl=0; nl<nlines; nl++) {
          printf("\033[1A");
@@ -146,7 +147,7 @@ void print_progress(uint32_t n, uint32_t Nt, uint64_t Npts, uint64_t Nb,
          printf(".");
       }
    }
-   double est_total = time_elapsed*Nt/n;
+   double est_total = n ? time_elapsed*Nt/n : 0.0;
 
    int sec, h_e, m_e, s_e, h_t, m_t, s_t;
    sec = (int)time_elapsed;

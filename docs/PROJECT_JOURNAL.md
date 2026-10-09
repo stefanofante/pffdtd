@@ -221,3 +221,31 @@ stack frame 96 B e zero spill dichiarati dal compilatore.
 **Aperto:** gate numerico device, stabilità/RIR e benchmark su Ada e GB10;
 sm_121 compilato su host x86_64 non sostituisce build host aarch64 DGX Spark.
 Scheduler Graphs e pipeline prepare/postprocess nativa restano da implementare.
+
+---
+
+## 2026-10-09 — Scheduler a eventi: attese host per blocco di output
+**Contesto:** il percorso a una GPU mantieneva tre attese stream e una attesa
+evento di timing a ogni timestep, anche senza scambi peer.
+**Modifiche:** `PFFDTD_ASYNC=1` abilita una catena di eventi a una GPU;
+boundary(n) attende air(n-1), air(n) attende boundary(n), readout(n) precede
+boundary(n+1) nello stesso stream. Drain e attesa host ogni 512 passi/fine.
+Stream nonblocking con sincronizzazione iniziale dopo setup; puntatori bulk
+e carry ruotano come prima. Ricevitori non interni e multi-GPU usano il
+riferimento; `SCHEDULER_SYNC` lo forza. Telemetria async wall-time a blocchi,
+`PFFDTD_PROGRESS=0` disabilita progressi. Corretto anche il progresso senza TTY
+e la stima del tempo al passo zero in `fdtd_common.h`.
+**Razionale:** le dipendenze device proteggono il riuso dei campi e del readout,
+consentendo di accodare passi senza attendere l'host dopo ciascuno. Il percorso
+rimane opzionale prima del gate hardware e non è ancora CUDA Graphs.
+**Esito:** PASS contratto nativo su 576 DAG randomizzati, checkpoint int64,
+rotazioni 2/3 e mutanti con dipendenze mancanti. Fixture CUDA completa
+sync/async con 40 casi per precisione, Cart/FCC, ABC/ADE, sorgenti, ricevitori
+duplicati e Nt attorno ai drain. PASS build CUDA FP32/FP64 e fixture per
+sm_89 e sm_121, più build del riferimento forzato `SCHEDULER_SYNC` su sm_89.
+Esecuzione delle fixture scheduler CUDA SKIP (exit 77): nessun device.
+La build sm_121 su x86_64 verifica il codice GPU; il binario DGX Spark
+richiede ancora host aarch64 e librerie corrispondenti.
+**Aperto:** gate CUDA/Compute Sanitizer e benchmark separati Ada/GB10;
+poi Graphs e specializzazione ADE con confronto misurato, oltre alla pipeline
+prepare/postprocess nativa.

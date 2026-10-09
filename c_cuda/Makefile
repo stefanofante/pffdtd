@@ -91,21 +91,30 @@ test-boundary:
 	$(CC) $(CFLAGS) ../tests/boundary_fd_check.c -o $(BUILD_DIR)/boundary_fd_double_test.x -DPRECISION=2 -DUSING_CUDA=false $(LDFLAGS)
 	OMP_NUM_THREADS=2 $(BUILD_DIR)/boundary_fd_double_test.x
 
-test-native: test-halo test-boundary
+test-scheduler:
+	mkdir -p $(BUILD_DIR)
+	$(CXX) -std=c++14 -O2 -Wall -Wextra -Wpedantic -I$(IDIR) ../tests/native/scheduler_plan_test.cpp -o $(BUILD_DIR)/scheduler_plan_test.x
+	$(BUILD_DIR)/scheduler_plan_test.x
+
+test-native: test-halo test-boundary test-scheduler
 
 build-cuda-tests:
 	mkdir -p $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/native/halo_faces_test.cpp -o $(BUILD_DIR)/halo_faces_cuda_test.x
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_fd_cuda_check.cu -o $(BUILD_DIR)/boundary_fd_single_cuda_test.x -DPRECISION=1 -DUSING_CUDA=true $(CULDFLAGS)
 	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/boundary_fd_cuda_check.cu -o $(BUILD_DIR)/boundary_fd_double_cuda_test.x -DPRECISION=2 -DUSING_CUDA=true $(CULDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/scheduler_cuda_check.cu -o $(BUILD_DIR)/scheduler_single_cuda_test.x -DPRECISION=1 -DUSING_CUDA=true $(CULDFLAGS)
+	$(NVCC) $(NVCCFLAGS) -std=c++11 ../tests/scheduler_cuda_check.cu -o $(BUILD_DIR)/scheduler_double_cuda_test.x -DPRECISION=2 -DUSING_CUDA=true $(CULDFLAGS)
 
 # Tests return 77 when no CUDA device is visible; preserve that result.
 test-cuda: build-cuda-tests
 	$(BUILD_DIR)/halo_faces_cuda_test.x
 	$(BUILD_DIR)/boundary_fd_single_cuda_test.x
 	$(BUILD_DIR)/boundary_fd_double_cuda_test.x
+	$(BUILD_DIR)/scheduler_single_cuda_test.x
+	$(BUILD_DIR)/scheduler_double_cuda_test.x
 
-.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single test-halo test-boundary test-native build-cuda-tests test-cuda clean
+.PHONY: all cpu gpu cpu_double cpu_single gpu_double gpu_single test-halo test-boundary test-scheduler test-native build-cuda-tests test-cuda clean
 
 clean:
 	rm -f $(BUILD_DIR)/*.x

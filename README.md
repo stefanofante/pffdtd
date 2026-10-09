@@ -148,6 +148,15 @@ make -C c_cuda test-native BUILD_DIR=/tmp/pffdtd-native
 make -C c_cuda test-cuda CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada-tests
 ```
 
+For a single GPU, `PFFDTD_ASYNC=1` enables an event-based scheduler that queues
+timesteps without per-step host barriers and drains output every 512 samples or
+at the final partial block. The synchronous scheduler remains the default and
+is used for multiple GPUs or receivers on ghost faces. `SCHEDULER_SYNC` forces
+the reference at compile time; `PFFDTD_PROGRESS=0` disables progress output.
+CUDA regression tests include full-engine comparisons of both runtime modes;
+select one device with `CUDA_VISIBLE_DEVICES` before running them. GPU correctness
+and speedup must be checked on each target before adopting the asynchronous mode.
+
 The native tests use C/C++ and check mirror-halo dependencies and the fused
 boundary pressure/ADE states. CUDA tests compare device results; they return
 status 77 when no device is available, which is a skipped check. `HALO_SEPARATE`
