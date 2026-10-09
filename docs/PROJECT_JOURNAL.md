@@ -318,3 +318,50 @@ Ns2/Nr6/Nb24/Nbl16,OMP2,exit0. Checker C++ conferma `u_out[6,3073]`:
 **Aperto:** il generatore è analitico Cartesian, non una migrazione generale
 di mesh/FCC/fitting/postprocess. Gate CUDA, stabilità/RIR e misure per target
 restano aperti; nessun guadagno prestazionale dedotto dalla prova CPU.
+
+---
+
+## 2026-10-09 — Budget device e limiti dei lanci CUDA
+**Contesto:** il solver non confrontava le allocazioni con la memoria libera;
+alcuni prodotti blockIdx restavano unsigned32 prima della conversione int64.
+Griglie sottili potevano superare maxGridSize pur richiedendo poca memoria.
+**Modifiche:** `memory_launch.h` somma tutti i buffer device con aritmetica
+controllata; preflight `cudaMemGetInfo` prima di mappe/campi/pinned output,
+mappa boundary e counter Graphs inclusi. Pinned host dichiarato separatamente.
+Ceil senza overflow, grid/block/thread validati e preparati una volta;
+promozione prima dei prodotti nei kernel, percorso B7 int32 conservato.
+**Razionale:** rifiutare richieste impossibili prima delle allocazioni e
+preservare gli indici su griglie grandi, senza mutare l'aritmetica fisica.
+**Esito:** PASS125 controlli strict e ASan/UBSan; review indipendente del
+budget contro tutte le cudaMalloc. Build Ada/GB10 FP32/FP64 e riferimenti
+compilate; CUDA runtime resta SKIP77.
+**Aperto:** overhead runtime/Graph e RAM host non sono inclusi nel budget;
+la memoria libera può cambiare, e non è una prenotazione. GB10 condivide RAM
+fisica; partizione adattiva e out-of-core restano da progettare e misurare.
+
+---
+
+## 2026-10-09 — Postprocessing RIR nativo CPU/CUDA
+**Contesto:** anche con forward CUDA il percorso finale dipendeva da calcolo
+Python. Il core della CLI usa ricombinazione, HP/integratore, resampling, LP
+opzionale, con aria disabilitata per default.
+**Modifiche:** `fdtd_post.cpp` legge HDF5 già scalato/riordinato, usa
+`post_dsp.h`, `post_resample.h` e backend `post_cuda.h`, scrive atomicamente
+`r_out_f`/`Fs_f` con metadati; protegge input, alias, symlink e overwrite.
+Butterworth e integratore nativi; FIR Kaiser analitico nuovo, floor esatto
+dei conteggi anche vicino agli interi. CUDA mantiene array/scratch residenti:
+seriale default, variante opt-in a chunk64 con risposta zero, prefisso affine
+e passaggio finale parallelo. `--verify` confronta ogni campione con CPU;
+nessun calcolo Python. Cambi di SOS/resampler non promettono bit equality SciPy.
+**Razionale:** rendere eseguibile prepare analitico→forward→post nativo e
+parallelizzare la ricorrenza temporale con carry espliciti e gate numerico.
+**Esito:** PASS576 design TF indipendenti e108 ricorrenze fino65537 campioni;
+PASS20896 check FIR e fuzz indipendente2M casi; PASS modello chunk/pipeline
+30.191.285 check, errore massimo relativo al picco4.73e-10. PASS ASan/UBSan.
+CLI/HDF malformed/alias/metadata e scena solver3073 passi→post CPU PASS.
+Scena FP32/FP64→resample44100Hz→LP simmetrico2000Hz: PASS HDF
+6x2823 campioni finiti/non nulli, metadati corretti e hash input invariati.
+CUDA post e driver230 confronti compilati per Ada/GB10; runtime SKIP77.
+**Aperto:** gate device/Compute Sanitizer, confronto RIR e prestazioni dei due
+target; preparazione mesh/FCC/fitting, filtri aria opzionali e WAV nativi.
+Il FIR analitico ha costo elevato per tap: valutare polyphase/LUT dopo gate.

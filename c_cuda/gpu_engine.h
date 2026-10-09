@@ -46,8 +46,18 @@
 #include <scheduler_plan.h>
 #include <graph_plan.h>
 #include <boundary_map.h>
+#include <memory_launch.h>
 
-#define CU_DIV_CEIL(x,y) ((DIV_CEIL(x,y)==0)? (1) : (DIV_CEIL(x,y))) //want 0 to map to 1, otherwise kernel errors
+static int64_t checked_nonzero_ceil(int64_t count, int64_t divisor)
+{
+   int64_t blocks;
+   if (!pffdtd::checked_ceil_count(count,divisor,blocks)) {
+      fprintf(stderr,"Invalid CUDA extent: count=%ld, divisor=%ld.\n",(long)count,(long)divisor);
+      exit(EXIT_FAILURE);
+   }
+   return blocks==0 ? 1 : blocks;
+}
+#define CU_DIV_CEIL(x,y) checked_nonzero_ceil((x),(y)) //CUDA requires at least one block for empty work.
 
 #if !USING_CUDA
 #error
@@ -189,6 +199,7 @@ struct gpuData { //for or on gpu (arrays all on GPU)
    dim3 grid_dim_fold;
    dim3 block_dim_readout;
    dim3 grid_dim_readout; 
+   dim3 grid_dim_source;
    dim3 block_dim_bn;
    dim3 block_dim_halo_xy;
    dim3 block_dim_halo_yz;
@@ -199,6 +210,7 @@ struct gpuData { //for or on gpu (arrays all on GPU)
    dim3 grid_dim_halo_xy; 
    dim3 grid_dim_halo_yz; 
    dim3 grid_dim_halo_xz; 
+   dim3 grid_dim_halo_faces;
    cudaStream_t cuStream_air;
    cudaStream_t cuStream_bn;
    cudaEvent_t cuEv_air_start;
@@ -224,7 +236,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 //print some device details
 uint64_t print_gpu_details(int i) {
    cudaDeviceProp prop;
-   cudaGetDeviceProperties(&prop, i);
+   gpuErrchk( cudaGetDeviceProperties(&prop, i) );
    printf("\nDevice Number: %d [%s]\n", i, prop.name);
    printf("  Compute: %d.%d\n",prop.major,prop.minor);
    int pffdtd_memClkKHz=0; cudaDeviceGetAttribute(&pffdtd_memClkKHz, cudaDevAttrMemoryClockRate, i); //CUDA 13: memoryClockRate removed from cudaDeviceProp
@@ -250,9 +262,9 @@ __global__ void KernelAirCart(Real * __restrict__ u0, const Real * __restrict__ 
    const Idx Ny   = (Idx)cuNy;
    const Idx Nz   = (Idx)cuNz;
    const Idx NxNy = (Idx)cuNxNy;
-   Idx cx = blockIdx.x*cuBx + threadIdx.x + 1;
-   Idx cy = blockIdx.y*cuBy + threadIdx.y + 1;
-   Idx cz = blockIdx.z*cuBz + threadIdx.z + 1;
+   Idx cx = (Idx)blockIdx.x*cuBx + threadIdx.x + 1;
+   Idx cy = (Idx)blockIdx.y*cuBy + threadIdx.y + 1;
+   Idx cz = (Idx)blockIdx.z*cuBz + threadIdx.z + 1;
    if ((cx<Nx-1) && (cy<Ny-1) && (cz<Nz-1)) {
       Idx ii = cz*NxNy + cy*Nx + cx;
       //divide-conquer add for better accuracy
@@ -284,9 +296,9 @@ __global__ void KernelAirFCC(Real * __restrict__ u0, const Real * __restrict__ u
    const Idx Nz   = (Idx)cuNz;
    const Idx NxNy = (Idx)cuNxNy;
    // get ix,iy,iz from thread and block Id's
-   Idx cx = blockIdx.x*cuBx + threadIdx.x + 1;
-   Idx cy = blockIdx.y*cuBy + threadIdx.y + 1;
-   Idx cz = blockIdx.z*cuBz + threadIdx.z + 1;
+   Idx cx = (Idx)blockIdx.x*cuBx + threadIdx.x + 1;
+   Idx cy = (Idx)blockIdx.y*cuBy + threadIdx.y + 1;
+   Idx cz = (Idx)blockIdx.z*cuBz + threadIdx.z + 1;
    if ((cx<Nx-1) && (cy<Ny-1) && (cz<Nz-1)) {
       //x is contiguous
       Idx ii = cz*NxNy + cy*Nx + cx;
@@ -320,8 +332,8 @@ __global__ void KernelFoldFCC(Real * __restrict__ u1)
    const Idx Ny   = (Idx)cuNy;
    const Idx Nz   = (Idx)cuNz;
    const Idx NxNy = (Idx)cuNxNy;
-   Idx cx = blockIdx.x*cuBx2 + threadIdx.x;
-   Idx cz = blockIdx.y*cuBy2 + threadIdx.y;
+   Idx cx = (Idx)blockIdx.x*cuBx2 + threadIdx.x;
+   Idx cz = (Idx)blockIdx.y*cuBy2 + threadIdx.y;
    //fold is along middle dimension
    if ((cx<Nx) && (cz<Nz)) {
       u1[cz*NxNy + (Ny-1)*Nx + cx] = u1[cz*NxNy + (Ny-2)*Nx + cx];
@@ -334,7 +346,7 @@ __global__ void KernelBoundaryRigidCart(Real * __restrict__ u0, const Real * __r
                                             const int64_t * __restrict__ bn_ixyz, 
                                             const int8_t * __restrict__ K_bn)
 {
-   int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   int64_t nb = (int64_t)blockIdx.x*cuBb + threadIdx.x;
    if (nb<cuNb) {
       int64_t ii = bn_ixyz[nb];
       uint16_t adj = adj_bn[nb];
@@ -363,7 +375,7 @@ __global__ void KernelBoundaryRigidFCC(Real * __restrict__ u0, const Real * __re
                                             const int64_t * __restrict__ bn_ixyz, 
                                             const int8_t * __restrict__ K_bn)
 {
-   int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   int64_t nb = (int64_t)blockIdx.x*cuBb + threadIdx.x;
    if (nb<cuNb) {
       int64_t ii = bn_ixyz[nb];
       uint16_t adj = adj_bn[nb];
@@ -397,7 +409,7 @@ __global__ void KernelBoundaryABC(Real * __restrict__ u0,
                                   const int8_t * __restrict__ Q_bna,
                                   const int64_t *  __restrict__ bna_ixyz)
 {
-   int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   int64_t nb = (int64_t)blockIdx.x*cuBb + threadIdx.x;
    if (nb<cuNba) {
       Real _1 = 1.0;
       Real lQ = cl*Q_bna[nb];
@@ -422,7 +434,7 @@ __global__ void KernelBoundaryStencil(
       const Real *ssaf_bnl, const int8_t *mat_bnl,
       const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads)
 {
-   const int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   const int64_t nb = (int64_t)blockIdx.x*cuBb + threadIdx.x;
    if (nb<cuNb)
       boundary_stencil_node<FCC,MapIdx,ADEMode>(u0,u1,u0b,u2b,vh1,gh1,bn_ixyz,adj_bn,K_bn,
          lossy_map,ssaf_bnl,mat_bnl,mat_beta,mat_quads,cuMb,csl2,c2,clo2,
@@ -437,7 +449,7 @@ __global__ void KernelBoundaryFDGrid(Real * __restrict__ u0, Real * __restrict__
                                   const Real * ssaf_bnl, const int8_t * mat_bnl,
                                   const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads)
 {
-   int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   int64_t nb = (int64_t)blockIdx.x*cuBb + threadIdx.x;
    if (nb<cuNbl) {
       boundary_fd_grid_node(u0,u0b,u2b,vh1,gh1,bnl_ixyz,ssaf_bnl,mat_bnl,
                             mat_beta,mat_quads,cuMb,clo2,cuNbl,nb);
@@ -450,7 +462,7 @@ __global__ void KernelBoundaryFD(Real * __restrict__ u0b, const Real *u2b,
                                   const Real * ssaf_bnl, const int8_t * mat_bnl,
                                   const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads)
 {  
-   int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   int64_t nb = (int64_t)blockIdx.x*cuBb + threadIdx.x;
    if (nb<cuNbl) {
       Real _1 = 1.0;
       Real _2 = 2.0;
@@ -502,7 +514,7 @@ __global__ void AddIn(Real *u0, Real sample)
 __global__ void AddInBatch(Real * __restrict__ u0, const int64_t * __restrict__ in_ixyz,
                            const double * __restrict__ in_sigs, int64_t Ns, int64_t Nt, int64_t n)
 {
-   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t i = (int64_t)blockIdx.x*cuBrw + threadIdx.x;
    if (i<Ns) u0[in_ixyz[i]] += (Real)(-in_sigs[i*Nt+n]);
 }
 
@@ -511,7 +523,7 @@ __global__ void AddInBatchGraph(Real * __restrict__ u0, const int64_t * __restri
                               const double * __restrict__ in_sigs, int64_t Ns, int64_t Nt,
                               const int64_t *step_base, int64_t offset)
 {
-   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t i = (int64_t)blockIdx.x*cuBrw + threadIdx.x;
    int64_t n = *step_base + offset;
    if (i<Ns) u0[in_ixyz[i]] += (Real)(-in_sigs[i*Nt+n]);
 }
@@ -519,7 +531,7 @@ __global__ void AddInBatchGraph(Real * __restrict__ u0, const int64_t * __restri
 __global__ void ReadoutGraph(Real *buffer, const Real *u, const int64_t *locs, int64_t N,
                             const int64_t *step_base, int64_t offset, int64_t readout_block)
 {
-   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t i = (int64_t)blockIdx.x*cuBrw + threadIdx.x;
    int64_t col = (*step_base + offset) % readout_block;
    if (i<N) buffer[col*N+i] = u[locs[i]];
 }
@@ -532,22 +544,22 @@ __global__ void AdvanceGraphStep(int64_t *step_base, int64_t steps)
 //dst-src copy from buffer to grid
 __global__ void CopyToGridKernel(Real *u, const Real *buffer,  const int64_t *locs, int64_t N)
 {
-   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t i = (int64_t)blockIdx.x*cuBrw + threadIdx.x;
    if (i<N) u[locs[i]] = buffer[i];
 }
 
 //dst-src copy to buffer from  grid (not needed, but to make more explicit)
 __global__ void CopyFromGridKernel(Real *buffer, const Real *u,  const int64_t *locs, int64_t N)
 {
-   int64_t i = blockIdx.x*cuBrw + threadIdx.x;
+   int64_t i = (int64_t)blockIdx.x*cuBrw + threadIdx.x;
    if (i<N) buffer[i] = u[locs[i]];
 }
 
 //flip halos for ABCs
 __global__ void FlipHaloXY_Zbeg(Real * __restrict__ u1)
 {
-   int64_t cx = blockIdx.x*cuBx2 + threadIdx.x;
-   int64_t cy = blockIdx.y*cuBy2 + threadIdx.y;
+   int64_t cx = (int64_t)blockIdx.x*cuBx2 + threadIdx.x;
+   int64_t cy = (int64_t)blockIdx.y*cuBy2 + threadIdx.y;
    if ((cx<cuNx) && (cy<cuNy)) {
       int64_t ii;
       ii = 0*cuNxNy + cy*cuNx + cx;
@@ -556,8 +568,8 @@ __global__ void FlipHaloXY_Zbeg(Real * __restrict__ u1)
 }
 __global__ void FlipHaloXY_Zend(Real * __restrict__ u1)
 {
-   int64_t cx = blockIdx.x*cuBx2 + threadIdx.x;
-   int64_t cy = blockIdx.y*cuBy2 + threadIdx.y;
+   int64_t cx = (int64_t)blockIdx.x*cuBx2 + threadIdx.x;
+   int64_t cy = (int64_t)blockIdx.y*cuBy2 + threadIdx.y;
    if ((cx<cuNx) && (cy<cuNy)) {
       int64_t ii;
       ii = (cuNz-1)*cuNxNy + cy*cuNx + cx;
@@ -566,8 +578,8 @@ __global__ void FlipHaloXY_Zend(Real * __restrict__ u1)
 }
 __global__ void FlipHaloXZ_Ybeg(Real * __restrict__ u1)
 {
-   int64_t cx = blockIdx.x*cuBx2 + threadIdx.x;
-   int64_t cz = blockIdx.y*cuBy2 + threadIdx.y;
+   int64_t cx = (int64_t)blockIdx.x*cuBx2 + threadIdx.x;
+   int64_t cz = (int64_t)blockIdx.y*cuBy2 + threadIdx.y;
    if ((cx<cuNx) && (cz<cuNz)) {
       int64_t ii;
       ii = cz*cuNxNy + 0*cuNx + cx;
@@ -576,8 +588,8 @@ __global__ void FlipHaloXZ_Ybeg(Real * __restrict__ u1)
 }
 __global__ void FlipHaloXZ_Yend(Real * __restrict__ u1)
 {
-   int64_t cx = blockIdx.x*cuBx2 + threadIdx.x;
-   int64_t cz = blockIdx.y*cuBy2 + threadIdx.y;
+   int64_t cx = (int64_t)blockIdx.x*cuBx2 + threadIdx.x;
+   int64_t cz = (int64_t)blockIdx.y*cuBy2 + threadIdx.y;
    if ((cx<cuNx) && (cz<cuNz)) {
       int64_t ii;
       ii = cz*cuNxNy + (cuNy-1)*cuNx + cx;
@@ -586,8 +598,8 @@ __global__ void FlipHaloXZ_Yend(Real * __restrict__ u1)
 }
 __global__ void FlipHaloYZ_Xbeg(Real * __restrict__ u1)
 {
-   int64_t cy = blockIdx.x*cuBx2 + threadIdx.x;
-   int64_t cz = blockIdx.y*cuBy2 + threadIdx.y;
+   int64_t cy = (int64_t)blockIdx.x*cuBx2 + threadIdx.x;
+   int64_t cz = (int64_t)blockIdx.y*cuBy2 + threadIdx.y;
    if ((cy<cuNy) && (cz<cuNz)) {
       int64_t ii;
       ii = cz*cuNxNy + cy*cuNx + 0;
@@ -596,8 +608,8 @@ __global__ void FlipHaloYZ_Xbeg(Real * __restrict__ u1)
 }
 __global__ void FlipHaloYZ_Xend(Real * __restrict__ u1)
 {
-   int64_t cy = blockIdx.x*cuBx2 + threadIdx.x;
-   int64_t cz = blockIdx.y*cuBy2 + threadIdx.y;
+   int64_t cy = (int64_t)blockIdx.x*cuBx2 + threadIdx.x;
+   int64_t cz = (int64_t)blockIdx.y*cuBy2 + threadIdx.y;
    if ((cy<cuNy) && (cz<cuNz)) {
       int64_t ii;
       ii = cz*cuNxNy + cy*cuNx + (cuNx-1);
@@ -615,8 +627,8 @@ __global__ void FlipHaloFaces(Real * __restrict__ u1)
    const Idx Ny   = (Idx)cuNy;
    const Idx Nz   = (Idx)cuNz;
    const Idx NxNy = (Idx)cuNxNy;
-   Idx a = blockIdx.x*cuBx2 + threadIdx.x;
-   Idx b = blockIdx.y*cuBy2 + threadIdx.y;
+   Idx a = (Idx)blockIdx.x*cuBx2 + threadIdx.x;
+   Idx b = (Idx)blockIdx.y*cuBy2 + threadIdx.y;
    Idx dst, src;
    if (pffdtd::halo_face_indices(Nx,Ny,Nz,NxNy,a,b,blockIdx.z,dst,src))
       u1[dst] = u1[src];
@@ -790,6 +802,137 @@ void split_data(const struct SimData *sd, struct gpuHostData *ghds, int ngpus) {
    assert(Nr_check==Nr);
 }
 
+static int64_t checked_elements(int64_t count, int64_t width, const char *name)
+{
+   size_t elements,checked_width;
+   if (!pffdtd::checked_count_bytes(width,1,checked_width) ||
+       !pffdtd::checked_count_bytes(count,checked_width,elements) ||
+       elements>(uint64_t)INT64_MAX) {
+      fprintf(stderr,"%s element count exceeds signed index/address range.\n",name);
+      exit(EXIT_FAILURE);
+   }
+   return (int64_t)elements;
+}
+
+static size_t checked_bytes(int64_t count, size_t width, const char *name)
+{
+   size_t bytes;
+   if (!pffdtd::checked_count_bytes(count,width,bytes)) {
+      fprintf(stderr,"%s allocation exceeds host address space.\n",name);
+      exit(EXIT_FAILURE);
+   }
+   return bytes;
+}
+
+static void validate_sim_extents(const struct SimData *sd, int readout_block)
+{
+   if (sd->Nx<3 || sd->Ny<3 || sd->Nz<3 || sd->Nt<=0 || sd->Nb<0 ||
+       sd->Nbl<0 || sd->Nbl>sd->Nb || sd->Nba<0 || sd->Ns<0 || sd->Nr<0 ||
+       sd->Nm<0 || sd->Nm>MNm) {
+      fprintf(stderr,"Invalid simulation dimensions, counts or material limit.\n");
+      exit(EXIT_FAILURE);
+   }
+   const int64_t yz = checked_elements(sd->Ny,sd->Nz,"Grid slice");
+   const int64_t points = checked_elements(sd->Nx,yz,"Global grid");
+   if (points!=sd->Npts) {
+      fprintf(stderr,"Npts does not match the checked grid dimensions.\n");
+      exit(EXIT_FAILURE);
+   }
+   checked_elements(sd->Ns,sd->Nt,"Source samples");
+   checked_elements(sd->Nr,sd->Nt,"Receiver samples");
+   checked_elements(sd->Nbl,MMb,"ADE states");
+   checked_elements(sd->Nr,readout_block,"Readout block");
+}
+
+static dim3 checked_grid(int gid, const char *name, int64_t x, int64_t y, int64_t z,
+                         dim3 block, const pffdtd::LaunchLimits &limits)
+{
+   pffdtd::LaunchShape grid_shape = {(uint64_t)x,(uint64_t)y,(uint64_t)z};
+   pffdtd::LaunchShape block_shape = {block.x,block.y,block.z};
+   if (!pffdtd::valid_launch(grid_shape,block_shape,limits)) {
+      fprintf(stderr,"GPU %d: %s grid [%ld,%ld,%ld], block [%u,%u,%u] exceeds device launch limits; max grid [%lu,%lu,%lu], block [%lu,%lu,%lu], threads %lu.\n",
+              gid,name,(long)x,(long)y,(long)z,block.x,block.y,block.z,
+              (unsigned long)limits.grid[0],(unsigned long)limits.grid[1],(unsigned long)limits.grid[2],
+              (unsigned long)limits.block[0],(unsigned long)limits.block[1],(unsigned long)limits.block[2],
+              (unsigned long)limits.threads);
+      exit(EXIT_FAILURE);
+   }
+   return dim3((unsigned int)x,(unsigned int)y,(unsigned int)z);
+}
+
+static void prepare_launches(const struct SimData *sd, struct gpuData *gd,
+                             const struct gpuHostData *ghd, const cudaDeviceProp &prop, int gid)
+{
+   pffdtd::LaunchLimits limits;
+   for (int axis=0; axis<3; axis++) {
+      limits.grid[axis] = (uint64_t)prop.maxGridSize[axis];
+      limits.block[axis] = (uint64_t)prop.maxThreadsDim[axis];
+   }
+   limits.threads = (uint64_t)prop.maxThreadsPerBlock;
+   gd->block_dim_air = dim3(cuBx,cuBy,cuBz);
+   gd->block_dim_readout = dim3(cuBrw,1,1);
+   gd->block_dim_bn = dim3(cuBb,1,1);
+   gd->block_dim_halo_xy = dim3(cuBx2,cuBy2,1);
+   gd->block_dim_halo_yz = dim3(cuBx2,cuBy2,1);
+   gd->block_dim_halo_xz = dim3(cuBx2,cuBy2,1);
+   gd->block_dim_fold = dim3(cuBx2,cuBy2,1);
+   gd->grid_dim_air = checked_grid(gid,"air",CU_DIV_CEIL(sd->Nz-2,cuBx),
+      CU_DIV_CEIL(sd->Ny-2,cuBy),CU_DIV_CEIL(ghd->Nxh-2,cuBz),gd->block_dim_air,limits);
+   gd->grid_dim_readout = checked_grid(gid,"readout",CU_DIV_CEIL(ghd->Nr,cuBrw),1,1,gd->block_dim_readout,limits);
+   gd->grid_dim_source = checked_grid(gid,"source",CU_DIV_CEIL(ghd->Ns,cuBrw),1,1,gd->block_dim_readout,limits);
+   gd->grid_dim_bn = checked_grid(gid,"boundary",CU_DIV_CEIL(ghd->Nb,cuBb),1,1,gd->block_dim_bn,limits);
+   gd->grid_dim_bnl = checked_grid(gid,"lossy boundary",CU_DIV_CEIL(ghd->Nbl,cuBb),1,1,gd->block_dim_bn,limits);
+   gd->grid_dim_bna = checked_grid(gid,"ABC",CU_DIV_CEIL(ghd->Nba,cuBb),1,1,gd->block_dim_bn,limits);
+   gd->grid_dim_halo_xy = checked_grid(gid,"XY halo",CU_DIV_CEIL(sd->Nz,cuBx2),CU_DIV_CEIL(sd->Ny,cuBy2),1,gd->block_dim_halo_xy,limits);
+   gd->grid_dim_halo_yz = checked_grid(gid,"YZ halo",CU_DIV_CEIL(sd->Ny,cuBx2),CU_DIV_CEIL(ghd->Nxh,cuBy2),1,gd->block_dim_halo_yz,limits);
+   gd->grid_dim_halo_xz = checked_grid(gid,"XZ halo",CU_DIV_CEIL(sd->Nz,cuBx2),CU_DIV_CEIL(ghd->Nxh,cuBy2),1,gd->block_dim_halo_xz,limits);
+   gd->grid_dim_halo_faces = checked_grid(gid,"fused halo",CU_DIV_CEIL(MAX(sd->Nz,sd->Ny),cuBx2),CU_DIV_CEIL(ghd->Nxh,cuBy2),3,gd->block_dim_halo_xz,limits);
+   gd->grid_dim_fold = checked_grid(gid,"FCC fold",CU_DIV_CEIL(sd->Nz,cuBx2),CU_DIV_CEIL(ghd->Nxh,cuBy2),1,gd->block_dim_fold,limits);
+}
+
+static void preflight_gpu_allocations(const struct SimData *sd, struct gpuData *gds,
+                                      struct gpuHostData *ghds, int ngpus, int readout_block,
+                                      bool fused_boundary, bool graphs, size_t host_pinned_bytes)
+{
+   printf("Host pinned readout request: %zu bytes (reported separately from device buffers).\n",host_pinned_bytes);
+   for (int gid=0; gid<ngpus; gid++) {
+      gpuErrchk( cudaSetDevice(gid) );
+      struct gpuData *gd = &gds[gid];
+      struct gpuHostData *ghd = &ghds[gid];
+      ghd->Nxh = ghd->Nx + (gid>0 ? 1 : 0) + (gid<ngpus-1 ? 1 : 0);
+      if (ghd->Nxh<3) {
+         fprintf(stderr,"GPU %d: partition has fewer than three grid planes; reduce visible GPU count.\n",gid);
+         exit(EXIT_FAILURE);
+      }
+      ghd->Npts = checked_elements(checked_elements(sd->Ny,sd->Nz,"Grid slice"),ghd->Nxh,"Local grid");
+      if (!pffdtd::checked_ceil_count(ghd->Npts,8,ghd->Nbm)) {
+         fprintf(stderr,"GPU %d: invalid boundary mask extent.\n",gid);
+         exit(EXIT_FAILURE);
+      }
+      cudaDeviceProp prop;
+      gpuErrchk( cudaGetDeviceProperties(&prop,gid) );
+      prepare_launches(sd,gd,ghd,prop,gid); //Validate before allocating maps, fields or pinned output.
+      pffdtd::MemoryCounts counts = {ghd->Npts,ghd->Nb,ghd->Nbl,ghd->Nba,ghd->Ns,ghd->Nr,
+                                   sd->Nt,sd->Nm,MMb,(size_t)readout_block};
+      const size_t map_bytes = fused_boundary ? (ghd->Nbl<=INT32_MAX ? sizeof(int32_t) : sizeof(int64_t)) : 0;
+      pffdtd::DeviceMemoryPlan plan;
+      if (!pffdtd::device_memory_plan(counts,sizeof(Real),sizeof(struct MatQuad),map_bytes,graphs,plan)) {
+         fprintf(stderr,"GPU %d: allocation byte counts overflow the host address range.\n",gid);
+         exit(EXIT_FAILURE);
+      }
+      size_t free_bytes,total_bytes;
+      gpuErrchk( cudaMemGetInfo(&free_bytes,&total_bytes) );
+      printf("GPU %d device allocation request: %zu bytes; free %zu / total %zu bytes.\n",
+             gid,plan.total_bytes,free_bytes,total_bytes);
+      if (plan.total_bytes>free_bytes) {
+         fprintf(stderr,"GPU %d: device buffers require %zu bytes, but cudaMemGetInfo reports %zu free bytes.\n",
+                 gid,plan.total_bytes,free_bytes);
+         exit(EXIT_FAILURE);
+      }
+   }
+   printf("Memory preflight covers explicit buffers; runtime/graph resources and host RAM remain additional requirements.\n");
+}
+
 template<typename MapIdx>
 static void prepare_boundary_map(struct gpuData *gd, const struct gpuHostData *ghd)
 {
@@ -937,14 +1080,11 @@ static void launch_gpu_step(const struct SimData *sd, struct gpuData *gd,
       FlipHaloXZ_Yend<<<gd->grid_dim_halo_xz,gd->block_dim_halo_xz,0,air_stream>>>(gd->u1);
    }
    {
-      int64_t amax = (sd->Nz > sd->Ny) ? sd->Nz : sd->Ny;  //a-axis covers max(Nx_kernel=Nz, Ny)
-      dim3 bdh(cuBx2, cuBy2, 1);
-      dim3 gdh(CU_DIV_CEIL(amax,cuBx2), CU_DIV_CEIL(ghd->Nxh,cuBy2), 3);
       if (ghd->Npts < INT32_MAX) {
-         FlipHaloFaces<int32_t><<<gdh,bdh,0,air_stream>>>(gd->u1);
+         FlipHaloFaces<int32_t><<<gd->grid_dim_halo_faces,gd->block_dim_halo_xz,0,air_stream>>>(gd->u1);
       }
       else {
-         FlipHaloFaces<int64_t><<<gdh,bdh,0,air_stream>>>(gd->u1);
+         FlipHaloFaces<int64_t><<<gd->grid_dim_halo_faces,gd->block_dim_halo_xz,0,air_stream>>>(gd->u1);
       }
    }
    }
@@ -952,9 +1092,9 @@ static void launch_gpu_step(const struct SimData *sd, struct gpuData *gd,
    //injecting source first, negation done inside kernel (NB source on different stream than bn)
    if (ghd->Ns>0) {
       if (step_base)
-         AddInBatchGraph<<<CU_DIV_CEIL(ghd->Ns,cuBrw),cuBrw,0,air_stream>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,step_base,offset);
+         AddInBatchGraph<<<gd->grid_dim_source,cuBrw,0,air_stream>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,step_base,offset);
       else
-         AddInBatch<<<CU_DIV_CEIL(ghd->Ns,cuBrw),cuBrw,0,air_stream>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,n);
+         AddInBatch<<<gd->grid_dim_source,cuBrw,0,air_stream>>>(gd->u0,gd->in_ixyz,gd->in_sigs,ghd->Ns,sd->Nt,n);
    }
    //now air updates (not conflicting with bn updates because of bn_mask)
    if (sd->fcc_flag==0) {
@@ -1027,6 +1167,8 @@ static cudaGraphExec_t capture_gpu_steps(const struct SimData *sd, struct gpuDat
 //run the sim!
 double run_sim(const struct SimData *sd) 
 {
+   const int READOUT_BLOCK = 512; //Drain receiver outputs in blocks.
+   validate_sim_extents(sd,READOUT_BLOCK);
    //if you want to test synchronous, env variable for that
    const char* s = getenv("CUDA_LAUNCH_BLOCKING");
    if (s != NULL) {
@@ -1080,9 +1222,9 @@ double run_sim(const struct SimData *sd)
           selected_ade_mode==2 ? "fixed-pole dispatch + scalar fallback" : "generic reference");
    assert(ngpus < (sd->Nx));
    struct gpuData *gds;
-   mymalloc((void **)&gds, ngpus*sizeof(gpuData)); 
+   mymalloc((void **)&gds, checked_bytes(ngpus,sizeof(gpuData),"Device metadata"));
    struct gpuHostData *ghds;
-   mymalloc((void **)&ghds, ngpus*sizeof(gpuHostData)); //one bit per 
+   mymalloc((void **)&ghds, checked_bytes(ngpus,sizeof(gpuHostData),"Host metadata"));
 
    if (ngpus>1) check_sorted(sd); //needs to be sorted for multi-GPU
 
@@ -1147,12 +1289,15 @@ double run_sim(const struct SimData *sd)
    int64_t Nx_pos=0;
    //uint64_t Nx_pos2=0;
 
-   const int READOUT_BLOCK = 512; //drain receiver outputs in blocks (fewer D2H transfers + syncs)
+   const size_t pinned_bytes = checked_bytes(sd->Nr,READOUT_BLOCK*sizeof(Real),"Pinned readout");
+   preflight_gpu_allocations(sd,gds,ghds,ngpus,READOUT_BLOCK,fused_boundary_requested,
+                             graphs_single_gpu,pinned_bytes);
    Real *u_out_buf; 
-   gpuErrchk( cudaMallocHost(&u_out_buf, (size_t)(sd->Nr*READOUT_BLOCK*sizeof(Real))) );
-   memset(u_out_buf, 0, (size_t)(sd->Nr*READOUT_BLOCK*sizeof(Real))); //set floats to zero
+   gpuErrchk( cudaSetDevice(0) );
+   gpuErrchk( cudaMallocHost(&u_out_buf,pinned_bytes) );
+   memset(u_out_buf,0,pinned_bytes);
 
-   int64_t Nzy = (sd->Nz)*(sd->Ny); //area-slice 
+   int64_t Nzy = checked_elements(sd->Nz,sd->Ny,"Grid slice");
 
    //here we recalculate indices to move to devices
    for (int gid=0; gid < ngpus; gid++) {
@@ -1171,14 +1316,7 @@ double run_sim(const struct SimData *sd)
       printf("Ns to read = %ld\n",ghd->Ns);
       printf("Nr to read = %ld\n",ghd->Nr);
 
-      //Nxh (effective Nx with extra halos)
-      ghd->Nxh = ghd->Nx;
-      if (gid>0) (ghd->Nxh)++; //add bottom halo
-      if (gid<ngpus-1) (ghd->Nxh)++; //add top halo
-      //calculate Npts for this device
-      ghd->Npts = Nzy*(ghd->Nxh);
-      //boundary mask
-      ghd->Nbm = CU_DIV_CEIL(ghd->Npts,8);
+      // Local shapes and launch dimensions were checked before any device-buffer allocations.
 
       printf("Nx=%ld Ns=%ld Nr=%ld Nb=%ld, Npts=%ld\n",ghd->Nx,ghd->Ns,ghd->Nr,ghd->Nb,ghd->Npts);
 
@@ -1355,45 +1493,7 @@ double run_sim(const struct SimData *sd)
       printf("Constant memory loaded\n");
       printf("\n");
 
-      //threads grids and blocks (swap x and z)
-      int64_t cuGx = CU_DIV_CEIL(sd->Nz-2,cuBx);
-      int64_t cuGy = CU_DIV_CEIL(sd->Ny-2,cuBy);
-      int64_t cuGz = CU_DIV_CEIL(ghd->Nxh-2,cuBz); 
-      int64_t cuGr = CU_DIV_CEIL(ghd->Nr,cuBrw); 
-      int64_t cuGb = CU_DIV_CEIL(ghd->Nb,cuBb);
-      int64_t cuGbl = CU_DIV_CEIL(ghd->Nbl,cuBb);
-      int64_t cuGba = CU_DIV_CEIL(ghd->Nba,cuBb);
-
-      int64_t cuGx2 = CU_DIV_CEIL(sd->Nz,cuBx2); //full face
-      int64_t cuGz2 = CU_DIV_CEIL(ghd->Nxh,cuBy2);  //full face
-
-      assert(cuGx >= 1);
-      assert(cuGy >= 1);
-      assert(cuGz >= 1);
-      assert(cuGr >= 1);
-      assert(cuGb >= 1);
-      assert(cuGbl >= 1);
-      assert(cuGba >= 1);
-
-      gd->block_dim_air     = dim3(cuBx, cuBy, cuBz);
-      gd->block_dim_readout = dim3(cuBrw, 1, 1);
-      gd->block_dim_bn      = dim3(cuBb, 1, 1);
-
-      gd->grid_dim_air      = dim3(cuGx, cuGy, cuGz);
-      gd->grid_dim_readout  = dim3(cuGr, 1, 1); 
-      gd->grid_dim_bn       = dim3(cuGb, 1, 1); 
-      gd->grid_dim_bnl       = dim3(cuGbl, 1, 1); 
-      gd->grid_dim_bna       = dim3(cuGba, 1, 1); 
-
-      gd->block_dim_halo_xy = dim3(cuBx2, cuBy2, 1);
-      gd->block_dim_halo_yz = dim3(cuBx2, cuBy2, 1);
-      gd->block_dim_halo_xz = dim3(cuBx2, cuBy2, 1);
-      gd->grid_dim_halo_xy  = dim3(CU_DIV_CEIL(sd->Nz,cuBx2), CU_DIV_CEIL(sd->Ny,cuBy2), 1);
-      gd->grid_dim_halo_yz  = dim3(CU_DIV_CEIL(sd->Ny,cuBx2), CU_DIV_CEIL(ghd->Nxh,cuBy2), 1);
-      gd->grid_dim_halo_xz  = dim3(CU_DIV_CEIL(sd->Nz,cuBx2), CU_DIV_CEIL(ghd->Nxh,cuBy2), 1);
-
-      gd->block_dim_fold     = dim3(cuBx2,cuBy2,1);
-      gd->grid_dim_fold      = dim3(cuGx2,cuGz2,1);
+      // Launch shapes were already validated by preflight_gpu_allocations.
 
       //create streams
       const unsigned int stream_flags = async_single_gpu ? cudaStreamNonBlocking : cudaStreamDefault;

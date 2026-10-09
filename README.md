@@ -182,9 +182,9 @@ and `BOUNDARY_SEPARATE` compiler defines retain the ordered-halo and three-pass
 boundary implementations for comparison. Define them through `NVCCFLAGS` when
 building a reference executable, retaining the normal includes and build flags.
 See [the CUDA audit](docs/CUDA_AUDIT.md) for the optimization plan and validation
-limits. General mesh preparation and postprocessing still use the existing
-Python scripts; their native C++/CUDA replacements remain to be implemented.
-Analytical benchmark inputs can now be generated entirely in C++.
+limits. General mesh preparation still uses the existing Python scripts;
+its native C++/CUDA replacement remains to be implemented. Analytical inputs
+and the core output processing can now run entirely in C++/CUDA.
 
 Build the native comparison harness with `make -C c_cuda benchmark` and the same
 architecture/library overrides as the engines. Run it from a prepared simulation
@@ -222,6 +222,35 @@ least eight cells. `--poles 0..12`, `--mixed-poles`, `--rigid-every N` and
 `test-native` includes 26 HDF5 round trips in each precision. A 3073-step mixed
 fixture also passed integration with the original CPU solver in FP32/FP64;
 CUDA execution and acoustic validation still require the hardware gates.
+
+Native output processing reads the original solver's `sim_outs.h5`, rebuilds
+physical receivers with `out_alpha`, applies integration/Butterworth high-pass,
+resampling and optional low-pass, and writes `r_out_f`/`Fs_f` in a new HDF5 file:
+
+```sh
+make -C c_cuda post_gpu CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada
+# Run the engine from the prepared directory to produce sim_outs.h5 first.
+/tmp/pffdtd-ada/fdtd_post_gpu.x --data-dir /tmp/pffdtd-panel --verify
+```
+
+Use `post_cpu` for a reference build without CUDA. Defaults match the original
+CLI's stages: 10 Hz high-pass of order 8, integration when `diff=1`, output at
+48 kHz, low-pass and air absorption disabled. `--sample-rate 0` retains the native
+rate; `--lowpass`, `--lowpass-order` and `--symmetric-lowpass` control the optional
+forward/reverse stage. Orders 1..16 are supported. SOS pairing can differ from
+SciPy and the analytic Kaiser sinc resampler is a new implementation: processed
+samples are compared with tolerances, rather than promised bit-identical.
+
+The CUDA backend retains receiver data and scratch on one stream. Its default
+IIR mode is serial; `--iir-mode chunked` computes zero-state responses for
+64-sample chunks, propagates their affine carries, then filters chunks in
+parallel. It changes rounding and requires a device comparison before use.
+`--verify` compares every CUDA sample against the C++ reference with
+`1e-12 + 1e-8*abs(reference)` tolerance. The default output refuses overwrites;
+`--overwrite` replaces an existing regular file while protecting input aliases
+and symlinks. `--save-raw` adds reconstructed receivers, and metadata records
+filters, backend, resampler and build revision. General mesh preparation,
+optional air absorption filters and WAV export still need native ports.
 
 The typical flow: build a model in Sketchup and export it (with source/receiver CSVs)
 to JSON via the provided plugin; fit absorption/impedance data; run a setup script
