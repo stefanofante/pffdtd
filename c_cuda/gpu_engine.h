@@ -42,6 +42,7 @@
 #ifndef _OMP_H
 #include <omp.h>
 #endif
+#include <halo_faces.h>
 
 #define CU_DIV_CEIL(x,y) ((DIV_CEIL(x,y)==0)? (1) : (DIV_CEIL(x,y))) //want 0 to map to 1, otherwise kernel errors
 
@@ -102,6 +103,12 @@ __global__ void KernelBoundaryABC(Real * __restrict__ u0,
                                   const int64_t *  __restrict__ bna_ixyz);
 __global__ void KernelBoundaryFD(Real * __restrict__ u0b, const Real *u2b,
                                   Real * __restrict__ vh1, Real * __restrict__ gh1,
+                                  const Real * ssaf_bnl, const int8_t * mat_bnl,
+                                  const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads);
+__global__ void KernelBoundaryFDGrid(Real * __restrict__ u0, Real * __restrict__ u0b,
+                                  const Real * __restrict__ u2b,
+                                  Real * __restrict__ vh1, Real * __restrict__ gh1,
+                                  const int64_t * __restrict__ bnl_ixyz,
                                   const Real * ssaf_bnl, const int8_t * mat_bnl,
                                   const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads);
 __global__ void AddIn(Real *u0, Real sample);
@@ -394,7 +401,25 @@ __global__ void KernelBoundaryABC(Real * __restrict__ u0,
    }
 }
 
-//Part of freq-dep boundary update 
+//Part of freq-dep boundary update
+#include <boundary_fd.h>
+
+// Gather, ADE correction and scatter in one launch; the rigid stencil stays ordered before it.
+__global__ void KernelBoundaryFDGrid(Real * __restrict__ u0, Real * __restrict__ u0b,
+                                  const Real * __restrict__ u2b,
+                                  Real * __restrict__ vh1, Real * __restrict__ gh1,
+                                  const int64_t * __restrict__ bnl_ixyz,
+                                  const Real * ssaf_bnl, const int8_t * mat_bnl,
+                                  const Real * __restrict__ mat_beta, const struct MatQuad * __restrict__ mat_quads)
+{
+   int64_t nb = blockIdx.x*cuBb + threadIdx.x;
+   if (nb<cuNbl) {
+      boundary_fd_grid_node(u0,u0b,u2b,vh1,gh1,bnl_ixyz,ssaf_bnl,mat_bnl,
+                            mat_beta,mat_quads,cuMb,clo2,cuNbl,nb);
+   }
+}
+
+// BOUNDARY_SEPARATE reference: original gather -> ADE -> scatter pipeline.
 __global__ void KernelBoundaryFD(Real * __restrict__ u0b, const Real *u2b,
                                   Real * __restrict__ vh1, Real * __restrict__ gh1,
                                   const Real * ssaf_bnl, const int8_t * mat_bnl,
@@ -532,11 +557,9 @@ __global__ void FlipHaloYZ_Xend(Real * __restrict__ u1)
    }
 }
 
-//B11: fused kernel for the 3 always-present halo faces (XZ_Ybeg + YZ_Xbeg + YZ_Xend)
-//in a single launch (blockIdx.z selects the face). NB the y=0 plane (XZ_Ybeg) overlaps
-//the x=0 / x=Nx-1 columns (YZ_Xbeg/Xend) at the edges; in the separate launches YZ runs
-//last and wins there. Here XZ skips those two columns (owned by YZ) so the writes are
-//disjoint and reproduce the separate last-writer result -> bit-identical. Same math.
+//B11: fuse the 3 always-present halo faces (XZ_Ybeg + YZ_Xbeg + YZ_Xend).
+//YZ owns the shared edges. Its y=0 sources compose both mirrors directly so they
+//never read XZ destinations written by another block in this same launch.
 template<typename Idx>
 __global__ void FlipHaloFaces(Real * __restrict__ u1)
 {
@@ -546,14 +569,9 @@ __global__ void FlipHaloFaces(Real * __restrict__ u1)
    const Idx NxNy = (Idx)cuNxNy;
    Idx a = blockIdx.x*cuBx2 + threadIdx.x;
    Idx b = blockIdx.y*cuBy2 + threadIdx.y;
-   if (b >= Nz) return;
-   if (blockIdx.z == 0) {            //XZ_Ybeg: y=0 plane, skip x=0 & x=Nx-1 (owned by YZ)
-      if (a >= 1 && a < Nx-1) { Idx ii = b*NxNy + a;            u1[ii] = u1[ii + 2*Nx]; }
-   } else if (blockIdx.z == 1) {     //YZ_Xbeg: x=0 column
-      if (a < Ny)             { Idx ii = b*NxNy + a*Nx;         u1[ii] = u1[ii + 2];    }
-   } else {                          //YZ_Xend: x=Nx-1 column
-      if (a < Ny)             { Idx ii = b*NxNy + a*Nx + (Nx-1); u1[ii] = u1[ii - 2];   }
-   }
+   Idx dst, src;
+   if (pffdtd::halo_face_indices(Nx,Ny,Nz,NxNy,a,b,blockIdx.z,dst,src))
+      u1[dst] = u1[src];
 }
 
 //input indices need to be sorted for multi-device allocation
@@ -740,7 +758,11 @@ double run_sim(const struct SimData *sd)
    assert((sd->fcc_flag != 1)); //uses either cartesian or FCC folded grid
 
    int ngpus,max_ngpus;
-   cudaGetDeviceCount(&max_ngpus); //control outside with CUDA_VISIBLE_DEVICES
+   gpuErrchk( cudaGetDeviceCount(&max_ngpus) ); //control outside with CUDA_VISIBLE_DEVICES
+   if (max_ngpus == 0) {
+      fprintf(stderr,"No CUDA device is visible; check the driver and CUDA_VISIBLE_DEVICES.\n");
+      exit(EXIT_FAILURE);
+   }
    ngpus = max_ngpus; 
    assert(ngpus < (sd->Nx));
    struct gpuData *gds;
@@ -1116,12 +1138,16 @@ double run_sim(const struct SimData *sd)
             }
             KernelBoundaryRigidFCC<<<gd->grid_dim_bn,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u1,gd->adj_bn,gd->bn_ixyz,gd->K_bn);
          }
-         //using buffer to then update FD boundaries
+         // Keep the three-slot pressure carry; only the gather/scatter intermediates are fused.
+#ifdef BOUNDARY_SEPARATE
          CopyFromGridKernel<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0b, gd->u0, gd->bnl_ixyz, ghd->Nbl);
          //possible this could be moved to host
          KernelBoundaryFD<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
          //copy to back to grid
          CopyToGridKernel<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0, gd->u0b, gd->bnl_ixyz, ghd->Nbl);
+#else
+         KernelBoundaryFDGrid<<<gd->grid_dim_bnl,gd->block_dim_bn,0,gd->cuStream_bn>>>(gd->u0,gd->u0b,gd->u2b,gd->vh1,gd->gh1,gd->bnl_ixyz,gd->ssaf_bnl,gd->mat_bnl,gd->mat_beta,gd->mat_quads);
+#endif
          gpuErrchk( cudaEventRecord(gd->cuEv_bn_roundtrip_end,gd->cuStream_bn) );
 
          //air updates (including source
@@ -1132,7 +1158,12 @@ double run_sim(const struct SimData *sd)
          //for absorbing boundaries at boundaries of grid
          CopyFromGridKernel<<<gd->grid_dim_bna,gd->block_dim_bn,0,gd->cuStream_air>>>(gd->u2ba, gd->u0, gd->bna_ixyz, ghd->Nba);
 #ifdef HALO_SEPARATE
-         //B11 A/B reference: original 6 separate halo-flip launches
+         const bool separate_halos = true; //B11 A/B reference
+#else
+         const bool separate_halos = !pffdtd::halo_faces_fusable(sd->Nz,sd->Ny);
+#endif
+         if (separate_halos) {
+         //Ordered faces also handle three-cell axes whose mirrors touch opposite halos.
          if (gid==0) {
             FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
          }
@@ -1145,10 +1176,11 @@ double run_sim(const struct SimData *sd)
          }
          FlipHaloYZ_Xbeg<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
          FlipHaloYZ_Xend<<<gd->grid_dim_halo_yz,gd->block_dim_halo_yz,0,gd->cuStream_air>>>(gd->u1);
-#else
+         }
+         else {
          //B11: conditional faces separate (different guards), 3 always-present faces fused.
-         //Order preserved: conditionals (XY_*, XZ_Yend) launch BEFORE the fused kernel so the
-         //shared edges keep the separate last-writer result.
+         //For axes >=4, XZ_Yend has no dependency on XZ_Ybeg, so it can precede
+         //the fused launch. XY faces are always completed first on this stream.
          if (gid==0) {
             FlipHaloXY_Zbeg<<<gd->grid_dim_halo_xy,gd->block_dim_halo_xy,0,gd->cuStream_air>>>(gd->u1);
          }
@@ -1169,7 +1201,7 @@ double run_sim(const struct SimData *sd)
                FlipHaloFaces<int64_t><<<gdh,bdh,0,gd->cuStream_air>>>(gd->u1);
             }
          }
-#endif
+         }
 
          //injecting source first, negation done inside kernel (NB source on different stream than bn)
          if (ghd->Ns>0) {

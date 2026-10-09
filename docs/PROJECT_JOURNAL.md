@@ -192,3 +192,32 @@ Nessuna simulazione Python eseguita. Analisi e prove host; nessun nuovo
 benchmark GPU o gate RIR, in assenza di dispositivo/toolkit nella macchina.
 **Aperto:** correggere B11, introdurre regressioni native, validare su GPU;
 poi scheduler e boundary con gate numerici e benchmark separati per target.
+
+---
+
+## 2026-10-09 — Correzione halo B11 e fusione trasferimenti boundary
+**Contesto:** l'audit sul commit `ad169d2` ha identificato una dipendenza RAW
+tra le facce fuse, oltre a due lanci gather/scatter eliminabili dai bordi ADE.
+**Modifiche:**
+- `c_cuda/halo_faces.h` compone direttamente le letture degli spigoli; il
+  kernel CUDA usa la stessa mappatura dei test e mantiene le facce ordinate
+  per assi di tre celle. `HALO_SEPARATE` conserva il riferimento.
+- `c_cuda/boundary_fd.h` e `KernelBoundaryFDGrid` fondono gather/ADE/scatter,
+  conservando rigid stencil, ordine aritmetico, stati per polo e tre carry.
+  `BOUNDARY_SEPARATE` conserva i tre passaggi originali.
+- Test C/C++ nativi e CUDA in `tests/`; Makefile con `CUDA_ARCH`, `BUILD_DIR`
+  e target `test-native`, `build-cuda-tests`, `test-cuda`.
+- Enumerazione CUDA controllata prima della partizione; README allineato
+  alla gestione memoria realmente implementata e ai nuovi comandi.
+**Razionale:** le letture composte rimuovono la dipendenza fra blocchi senza
+un lancio aggiuntivo. La fusione ADE rimuove due lanci e accessi espliciti
+pari a 20 B/nodo/step FP32 o 32 B FP64; non sono misure del traffico DRAM.
+**Esito:** PASS 640 casi halo host e, per precisione, 10 casi ADE x 37 passi,
+incluse tutte le rotazioni, stati usati e padding; PASS sanitizer host.
+PASS build CUDA FP32/FP64 per sm_89 e sm_121, percorsi fusi e separati;
+PASS compilazione test CUDA. Esecuzione CUDA SKIP (exit 77): nessun device.
+Nel build sm_89 FP32 i kernel ADE originale/fuso hanno entrambi 40 registri,
+stack frame 96 B e zero spill dichiarati dal compilatore.
+**Aperto:** gate numerico device, stabilità/RIR e benchmark su Ada e GB10;
+sm_121 compilato su host x86_64 non sostituisce build host aarch64 DGX Spark.
+Scheduler Graphs e pipeline prepare/postprocess nativa restano da implementare.

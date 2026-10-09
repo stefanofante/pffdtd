@@ -162,3 +162,15 @@ Per modifiche di scheduling/layout che preservano ordine aritmetico usare confro
 ## Validazione ancora necessaria
 
 Per completare i gate CUDA occorrono dispositivi NVIDIA e toolchain compatibili su entrambi i target. Il successo della compilazione host e del modello di dipendenza non valida l'esecuzione GPU, le RIR o i guadagni prestazionali. Il flusso numerico nativo completo richiede ancora la migrazione di prepare e postprocess.
+
+## Interventi successivi all'audit
+
+La correzione halo legge direttamente i punti con entrambe le riflessioni applicate agli spigoli `y=0`. La funzione condivisa `c_cuda/halo_faces.h` permette di verificare che tutte le destinazioni siano uniche e che nessuna sorgente appartenga al write-set. Per assi di tre celle il runtime conserva le facce ordinate. `tests/native/halo_faces_test.cpp` copre 640 casi host, FP32/FP64, int32/int64, Cart/FCC, fold, estremi delle slab, ordini dei volti e interleaving dei thread, oltre agli indici int64 grandi. Compilando lo stesso file con nvcc si esercita anche la funzione su device.
+
+La pipeline dissipativa ora offre un kernel unico che legge la griglia, applica la stessa ricorrenza ADE e scrive pressione finale e carry. Il rigid stencil, i tre carry e l'ordine dei calcoli sono conservati. `BOUNDARY_SEPARATE` mantiene l'originale gather/ADE/scatter come riferimento indipendente. Si eliminano due lanci e, dal conteggio degli accessi espliciti, `3*sizeof(Real)+sizeof(int64_t)` byte per nodo e timestep: 20 byte in FP32, 32 in FP64. È una riduzione degli accessi richiesti, non una misura del traffico DRAM o dell'accelerazione.
+
+`tests/boundary_fd_check.c` confronta il percorso condiviso con il solver ADE CPU esistente su dieci casi e 37 passi per precisione, inclusi tutti i bank della pressione, gli stati usati e il padding. `tests/boundary_fd_cuda_check.cu` confronta i due kernel CUDA con 257 nodi, più blocchi e gli stessi periodi di rotazione, senza fixture Python.
+
+Il Makefile consente architetture esplicite e output fuori checkout, oltre a test nativi e CUDA. I test CUDA segnalano assenza hardware con exit 77; la loro compilazione non equivale all'esecuzione. Le build `sm_121` effettuate su x86_64 validano il codice device GB10; per l'eseguibile DGX Spark occorre ancora la build host aarch64. Il runtime controlla ora l'esito dell'enumerazione CUDA prima di partizionare la griglia. Il README è allineato all'attuale gestione memoria, ancora priva di budget adattivo.
+
+I gate hardware, i benchmark e il nuovo scheduler restano aperti. Per CUDA Graphs va gestita anche la fase del readout a 512 campioni: il solo periodo di sei passi dei puntatori non chiude tutte le fasi (LCM 1536), salvo contatori/nodi aggiornati o varianti del grafo progettate esplicitamente.

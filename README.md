@@ -89,11 +89,11 @@ Performance work is tuned on the hardware it runs on:
 - **NVIDIA RTX 4500 Ada Generation** (24 GB, dedicated VRAM) — the workstation baseline.
 - **NVIDIA DGX Spark (GB10 Grace-Blackwell)** — aarch64, 128 GB unified memory.
 
-The two targets differ in memory behaviour: dedicated VRAM fails hard on
-over-allocation, whereas the GB10's unified memory degrades gradually. Memory
-budgeting is therefore queried at **runtime** (free VRAM via `cudaMemGetInfo` minus
-an adaptive safety margin) rather than hard-coded — the engine discovers the GPU it
-is running on and adapts, instead of assuming a fixed device at build time.
+The two targets differ in memory behaviour: Ada has dedicated VRAM, whereas GB10
+shares physical memory with the host. The engine currently uses `cudaMalloc` and
+reports device capacity; it does not yet query free memory or enforce a safety
+budget before allocation. Scene sizing must leave room for the host and driver,
+especially on GB10. Shared physical memory does not imply managed-memory paging.
 
 ## Relationship to `dg-acoustics`
 
@@ -135,6 +135,28 @@ the other worthwhile.
 PFFDTD runs on Linux with the CUDA toolkit and HDF5. To build the engines, run
 `make all` in the `c_cuda` folder (see the Makefile for HDF5 paths). The Python side
 needs Python 3.9+ with the packages in `pip_requirements.txt` (or the conda env).
+
+Use `CUDA_ARCH=sm_89` for RTX 4500 Ada or `CUDA_ARCH=sm_121` for GB10 with a
+compatible toolkit. The default remains `native`. GPU code for GB10 can be
+compiled on x86_64, but the complete executable also needs an aarch64 host build
+and matching HDF5 libraries to run on DGX Spark. `BUILD_DIR` keeps generated files
+outside the checkout, for example:
+
+```sh
+make -C c_cuda -j2 gpu CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada
+make -C c_cuda test-native BUILD_DIR=/tmp/pffdtd-native
+make -C c_cuda test-cuda CUDA_ARCH=sm_89 BUILD_DIR=/tmp/pffdtd-ada-tests
+```
+
+The native tests use C/C++ and check mirror-halo dependencies and the fused
+boundary pressure/ADE states. CUDA tests compare device results; they return
+status 77 when no device is available, which is a skipped check. `HALO_SEPARATE`
+and `BOUNDARY_SEPARATE` compiler defines retain the ordered-halo and three-pass
+boundary implementations for comparison. Define them through `NVCCFLAGS` when
+building a reference executable, retaining the normal includes and build flags.
+See [the CUDA audit](docs/CUDA_AUDIT.md) for the optimization plan and validation
+limits. Preparation and postprocessing still use the existing Python scripts;
+their native C++/CUDA replacements remain to be implemented.
 
 The typical flow: build a model in Sketchup and export it (with source/receiver CSVs)
 to JSON via the provided plugin; fit absorption/impedance data; run a setup script
